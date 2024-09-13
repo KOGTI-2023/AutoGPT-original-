@@ -13,6 +13,7 @@ export type Block = {
   inputSchema: BlockIORootSchema;
   outputSchema: BlockIORootSchema;
   staticOutput: boolean;
+  uiType: BlockUIType;
 };
 
 export type BlockIORootSchema = {
@@ -39,6 +40,7 @@ export type BlockIOSubSchemaMeta = {
   title?: string;
   description?: string;
   placeholder?: string;
+  advanced?: boolean;
 };
 
 export type BlockIOObjectSubSchema = BlockIOSubSchemaMeta & {
@@ -181,3 +183,10 @@ export type User = {
   id: string;
   email: string;
 };
+
+export enum BlockUIType {
+  STANDARD = "Standard",
+  INPUT = "Input",
+  OUTPUT = "Output",
+  NOTE = "Note",
+}

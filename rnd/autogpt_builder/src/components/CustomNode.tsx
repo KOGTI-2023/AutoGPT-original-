@@ -12,19 +12,26 @@ import InputModalComponent from "./InputModalComponent";
 import OutputModalComponent from "./OutputModalComponent";
 import {
   BlockIORootSchema,
+  BlockIOStringSubSchema,
   Category,
   NodeExecutionResult,
+  BlockUIType,
 } from "@/lib/autogpt-server-api/types";
-import { beautifyString, setNestedProperty } from "@/lib/utils";
+import { beautifyString, cn, setNestedProperty } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
 import { Copy, Trash2 } from "lucide-react";
 import { history } from "./history";
 import NodeHandle from "./NodeHandle";
-import { NodeGenericInputField } from "./node-input-components";
+import {
+  NodeGenericInputField,
+  NodeTextBoxInput,
+} from "./node-input-components";
 import SchemaTooltip from "./SchemaTooltip";
 import { getPrimaryCategoryColor } from "@/lib/utils";
 import { FlowContext } from "./Flow";
+import { Badge } from "./ui/badge";
+import DataTable from "./DataTable";
 
 type ParsedKey = { key: string; index?: number };
 
@@ -47,11 +54,17 @@ export type CustomNodeData = {
   connections: ConnectionData;
   isOutputOpen: boolean;
   status?: NodeExecutionResult["status"];
-  output_data?: NodeExecutionResult["output_data"];
+  /** executionResults contains outputs across multiple executions
+   * with the last element being the most recent output */
+  executionResults?: {
+    execId: string;
+    data: NodeExecutionResult["output_data"];
+  }[];
   block_id: string;
   backend_id?: string;
   errors?: { [key: string]: string };
   isOutputStatic?: boolean;
+  uiType: BlockUIType;
 };
 
 export type CustomNode = Node<CustomNodeData, "custom">;
@@ -61,7 +74,7 @@ export function CustomNode({ data, id, width, height }: NodeProps<CustomNode>) {
   const [isAdvancedOpen, setIsAdvancedOpen] = useState(false);
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [activeKey, setActiveKey] = useState<string | null>(null);
-  const [modalValue, setModalValue] = useState<string>("");
+  const [inputModalValue, setInputModalValue] = useState<string>("");
   const [isOutputModalOpen, setIsOutputModalOpen] = useState(false);
   const [isHovered, setIsHovered] = useState(false);
   const { updateNodeData, deleteElements, addNodes, getNode } = useReactFlow<
@@ -78,10 +91,10 @@ export function CustomNode({ data, id, width, height }: NodeProps<CustomNode>) {
   const { setIsAnyModalOpen, getNextNodeId } = flowContext;
 
   useEffect(() => {
-    if (data.output_data || data.status) {
+    if (data.executionResults || data.status) {
       setIsOutputOpen(true);
     }
-  }, [data.output_data, data.status]);
+  }, [data.executionResults, data.status]);
 
   useEffect(() => {
     setIsOutputOpen(data.isOutputOpen);
@@ -89,7 +102,7 @@ export function CustomNode({ data, id, width, height }: NodeProps<CustomNode>) {
 
   useEffect(() => {
     setIsAnyModalOpen?.(isModalOpen || isOutputModalOpen);
-  }, [isModalOpen, isOutputModalOpen, data]);
+  }, [isModalOpen, isOutputModalOpen, data, setIsAnyModalOpen]);
 
   useEffect(() => {
     isInitialSetup.current = false;
@@ -111,14 +124,16 @@ export function CustomNode({ data, id, width, height }: NodeProps<CustomNode>) {
     setIsAdvancedOpen(checked);
   };
 
-  const hasOptionalFields =
-    data.inputSchema &&
-    Object.keys(data.inputSchema.properties).some((key) => {
-      return !data.inputSchema.required?.includes(key);
-    });
-
-  const generateOutputHandles = (schema: BlockIORootSchema) => {
-    if (!schema?.properties) return null;
+  const generateOutputHandles = (
+    schema: BlockIORootSchema,
+    nodeType: BlockUIType,
+  ) => {
+    if (
+      !schema?.properties ||
+      nodeType === BlockUIType.OUTPUT ||
+      nodeType === BlockUIType.NOTE
+    )
+      return null;
     const keys = Object.keys(schema.properties);
     return keys.map((key) => (
       <div key={key}>
@@ -132,6 +147,137 @@ export function CustomNode({ data, id, width, height }: NodeProps<CustomNode>) {
     ));
   };
 
+  const generateInputHandles = (
+    schema: BlockIORootSchema,
+    nodeType: BlockUIType,
+  ) => {
+    if (!schema?.properties) return null;
+    let keys = Object.entries(schema.properties);
+    switch (nodeType) {
+      case BlockUIType.INPUT:
+        // For INPUT blocks, dont include connection handles
+        return keys.map(([propKey, propSchema]) => {
+          const isRequired = data.inputSchema.required?.includes(propKey);
+          const isConnected = isHandleConnected(propKey);
+          const isAdvanced = propSchema.advanced;
+          return (
+            (isRequired || isAdvancedOpen || !isAdvanced) && (
+              <div key={propKey}>
+                <span className="text-m green -mb-1 text-gray-900">
+                  {propSchema.title || beautifyString(propKey)}
+                </span>
+                <div key={propKey} onMouseOver={() => {}}>
+                  {!isConnected && (
+                    <NodeGenericInputField
+                      className="mb-2 mt-1"
+                      propKey={propKey}
+                      propSchema={propSchema}
+                      currentValue={getValue(propKey)}
+                      connections={data.connections}
+                      handleInputChange={handleInputChange}
+                      handleInputClick={handleInputClick}
+                      errors={data.errors ?? {}}
+                      displayName={propSchema.title || beautifyString(propKey)}
+                    />
+                  )}
+                </div>
+              </div>
+            )
+          );
+        });
+
+      case BlockUIType.NOTE:
+        // For NOTE blocks, don't render any input handles
+        const [noteKey, noteSchema] = keys[0];
+        return (
+          <div key={noteKey}>
+            <NodeTextBoxInput
+              className=""
+              selfKey={noteKey}
+              schema={noteSchema as BlockIOStringSubSchema}
+              value={getValue(noteKey)}
+              handleInputChange={handleInputChange}
+              handleInputClick={handleInputClick}
+              error={data.errors?.[noteKey] ?? ""}
+              displayName={noteSchema.title || beautifyString(noteKey)}
+            />
+          </div>
+        );
+
+      case BlockUIType.OUTPUT:
+        // For OUTPUT blocks, only show the 'value' property
+        return keys.map(([propKey, propSchema]) => {
+          const isRequired = data.inputSchema.required?.includes(propKey);
+          const isConnected = isHandleConnected(propKey);
+          const isAdvanced = propSchema.advanced;
+          return (
+            (isRequired || isAdvancedOpen || !isAdvanced) && (
+              <div key={propKey} onMouseOver={() => {}}>
+                {propKey !== "value" ? (
+                  <span className="text-m green -mb-1 text-gray-900">
+                    {propSchema.title || beautifyString(propKey)}
+                  </span>
+                ) : (
+                  <NodeHandle
+                    keyName={propKey}
+                    isConnected={isConnected}
+                    isRequired={isRequired}
+                    schema={propSchema}
+                    side="left"
+                  />
+                )}
+                {!isConnected && (
+                  <NodeGenericInputField
+                    className="mb-2 mt-1"
+                    propKey={propKey}
+                    propSchema={propSchema}
+                    currentValue={getValue(propKey)}
+                    connections={data.connections}
+                    handleInputChange={handleInputChange}
+                    handleInputClick={handleInputClick}
+                    errors={data.errors ?? {}}
+                    displayName={propSchema.title || beautifyString(propKey)}
+                  />
+                )}
+              </div>
+            )
+          );
+        });
+
+      default:
+        return keys.map(([propKey, propSchema]) => {
+          const isRequired = data.inputSchema.required?.includes(propKey);
+          const isConnected = isHandleConnected(propKey);
+          const isAdvanced = propSchema.advanced;
+          return (
+            (isRequired || isAdvancedOpen || isConnected || !isAdvanced) && (
+              <div key={propKey} onMouseOver={() => {}}>
+                <NodeHandle
+                  keyName={propKey}
+                  isConnected={isConnected}
+                  isRequired={isRequired}
+                  schema={propSchema}
+                  side="left"
+                />
+                {!isConnected && (
+                  <NodeGenericInputField
+                    className="mb-2 mt-1"
+                    propKey={propKey}
+                    propSchema={propSchema}
+                    currentValue={getValue(propKey)}
+                    connections={data.connections}
+                    handleInputChange={handleInputChange}
+                    handleInputClick={handleInputClick}
+                    errors={data.errors ?? {}}
+                    displayName={propSchema.title || beautifyString(propKey)}
+                  />
+                )}
+              </div>
+            )
+          );
+        });
+    }
+  };
   const handleInputChange = (path: string, value: any) => {
     const keys = parseKeys(path);
     const newValues = JSON.parse(JSON.stringify(data.hardcodedValues));
@@ -240,7 +386,7 @@ export function CustomNode({ data, id, width, height }: NodeProps<CustomNode>) {
     console.log(`Opening modal for key: ${key}`);
     setActiveKey(key);
     const value = getValue(key);
-    setModalValue(
+    setInputModalValue(
       typeof value === "object" ? JSON.stringify(value, null, 2) : value,
     );
     setIsModalOpen(true);
@@ -261,11 +407,6 @@ export function CustomNode({ data, id, width, height }: NodeProps<CustomNode>) {
 
   const handleOutputClick = () => {
     setIsOutputModalOpen(true);
-    setModalValue(
-      data.output_data
-        ? JSON.stringify(data.output_data, null, 2)
-        : "[no output (yet)]",
-    );
   };
 
   const handleHovered = () => {
@@ -323,7 +464,7 @@ export function CustomNode({ data, id, width, height }: NodeProps<CustomNode>) {
   const hasConfigErrors =
     data.errors &&
     Object.entries(data.errors).some(([_, value]) => value !== null);
-  const outputData = data.output_data;
+  const outputData = data.executionResults?.at(-1)?.data;
   const hasOutputError =
     typeof outputData === "object" &&
     outputData !== null &&
@@ -366,20 +507,29 @@ export function CustomNode({ data, id, width, height }: NodeProps<CustomNode>) {
 
   const errorClass =
     hasConfigErrors || hasOutputError ? "border-red-500 border-2" : "";
+
   const statusClass =
     hasConfigErrors || hasOutputError
       ? "failed"
       : (data.status?.toLowerCase() ?? "");
 
+  const hasAdvancedFields =
+    data.inputSchema &&
+    Object.entries(data.inputSchema.properties).some(([key, value]) => {
+      return (
+        value.advanced === true && !data.inputSchema.required?.includes(key)
+      );
+    });
+
   return (
     <div
-      className={`${blockClasses} ${errorClass} ${statusClass}`}
+      className={`${data.uiType === BlockUIType.NOTE ? "w-[300px]" : "w-[500px]"} ${blockClasses} ${errorClass} ${statusClass} ${data.uiType === BlockUIType.NOTE ? "bg-yellow-100" : "bg-white"}`}
       onMouseEnter={handleHovered}
       onMouseLeave={handleMouseLeave}
       data-id={`custom-node-${id}`}
     >
       <div
-        className={`mb-2 p-3 ${getPrimaryCategoryColor(data.categories)} rounded-t-xl`}
+        className={`mb-2 p-3 ${data.uiType === BlockUIType.NOTE ? "bg-yellow-100" : getPrimaryCategoryColor(data.categories)} rounded-t-xl`}
       >
         <div className="flex items-center justify-between">
           <div className="font-roboto p-3 text-lg font-semibold">
@@ -412,94 +562,79 @@ export function CustomNode({ data, id, width, height }: NodeProps<CustomNode>) {
           )}
         </div>
       </div>
-      <div className="flex items-start justify-between gap-2 p-3">
+      {data.uiType !== BlockUIType.NOTE ? (
+        <div className="flex items-start justify-between p-3">
+          <div>
+            {data.inputSchema &&
+              generateInputHandles(data.inputSchema, data.uiType)}
+          </div>
+          <div className="flex-none">
+            {data.outputSchema &&
+              generateOutputHandles(data.outputSchema, data.uiType)}
+          </div>
+        </div>
+      ) : (
         <div>
           {data.inputSchema &&
-            Object.entries(data.inputSchema.properties).map(
-              ([propKey, propSchema]) => {
-                const isRequired = data.inputSchema.required?.includes(propKey);
-                const isConnected = isHandleConnected(propKey);
-                return (
-                  (isRequired || isAdvancedOpen || isConnected) && (
-                    <div key={propKey} onMouseOver={() => {}}>
-                      <NodeHandle
-                        keyName={propKey}
-                        isConnected={isConnected}
-                        isRequired={isRequired}
-                        schema={propSchema}
-                        side="left"
-                      />
-                      {!isConnected && (
-                        <NodeGenericInputField
-                          className="mb-2 mt-1"
-                          propKey={propKey}
-                          propSchema={propSchema}
-                          currentValue={getValue(propKey)}
-                          connections={data.connections}
-                          handleInputChange={handleInputChange}
-                          handleInputClick={handleInputClick}
-                          errors={data.errors ?? {}}
-                          displayName={
-                            propSchema.title || beautifyString(propKey)
-                          }
-                        />
-                      )}
-                    </div>
-                  )
-                );
-              },
-            )}
-        </div>
-        <div className="flex-none">
-          {data.outputSchema && generateOutputHandles(data.outputSchema)}
-        </div>
-      </div>
-      {isOutputOpen && (
-        <div className="node-output break-words" onClick={handleOutputClick}>
-          <p>
-            <strong>Status:</strong>{" "}
-            {typeof data.status === "object"
-              ? JSON.stringify(data.status)
-              : data.status || "N/A"}
-          </p>
-          <p>
-            <strong>Output Data:</strong>{" "}
-            {(() => {
-              const outputText =
-                typeof data.output_data === "object"
-                  ? JSON.stringify(data.output_data)
-                  : data.output_data;
-
-              if (!outputText) return "No output data";
-
-              return outputText.length > 100
-                ? `${outputText.slice(0, 100)}... Press To Read More`
-                : outputText;
-            })()}
-          </p>
+            generateInputHandles(data.inputSchema, data.uiType)}
         </div>
       )}
-      <div className="mt-2.5 flex items-center pb-4 pl-4">
-        <Switch onCheckedChange={toggleOutput} />
-        <span className="m-1 mr-4">Output</span>
-        {hasOptionalFields && (
-          <>
-            <Switch onCheckedChange={toggleAdvancedSettings} />
-            <span className="m-1">Advanced</span>
-          </>
-        )}
-      </div>
+      {isOutputOpen && data.uiType !== BlockUIType.NOTE && (
+        <div
+          data-id="latest-output"
+          className="nodrag m-3 break-words rounded-md border-[1.5px] p-2"
+        >
+          {(data.executionResults?.length ?? 0) > 0 ? (
+            <>
+              <DataTable
+                title="Latest Output"
+                truncateLongData
+                data={data.executionResults!.at(-1)?.data || {}}
+              />
+              <div className="flex justify-end">
+                <Button variant="ghost" onClick={handleOutputClick}>
+                  View More
+                </Button>
+              </div>
+            </>
+          ) : (
+            <span>No outputs yet</span>
+          )}
+        </div>
+      )}
+      {data.uiType !== BlockUIType.NOTE && (
+        <div className="mt-2.5 flex items-center pb-4 pl-4">
+          <Switch checked={isOutputOpen} onCheckedChange={toggleOutput} />
+          <span className="m-1 mr-4">Output</span>
+          {hasAdvancedFields && (
+            <>
+              <Switch onCheckedChange={toggleAdvancedSettings} />
+              <span className="m-1">Advanced</span>
+            </>
+          )}
+          {data.status && (
+            <Badge
+              variant="outline"
+              data-id={`badge-${id}-${data.status}`}
+              className={cn(data.status.toLowerCase(), "ml-auto mr-5")}
+            >
+              {data.status}
+            </Badge>
+          )}
+        </div>
+      )}
       <InputModalComponent
+        title={activeKey ? `Enter ${beautifyString(activeKey)}` : undefined}
         isOpen={isModalOpen}
         onClose={() => setIsModalOpen(false)}
         onSave={handleModalSave}
-        value={modalValue}
+        defaultValue={inputModalValue}
         key={activeKey}
       />
       <OutputModalComponent
         isOpen={isOutputModalOpen}
         onClose={() => setIsOutputModalOpen(false)}
-        value={modalValue}
+        executionResults={data.executionResults?.toReversed() || []}
       />
     </div>
   );

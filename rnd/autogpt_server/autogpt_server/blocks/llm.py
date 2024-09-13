@@ -84,6 +84,9 @@ class AIStructuredResponseGeneratorBlock(Block):
         api_key: BlockSecret = SecretField(value="")
         sys_prompt: str = ""
         retry: int = 3
+        prompt_values: dict[str, str] = SchemaField(
+            advanced=False, default={}, description="Values used to fill in the prompt."
+        )
 
     class Output(BlockSchema):
         response: dict[str, str]
@@ -167,6 +170,11 @@ class AIStructuredResponseGeneratorBlock(Block):
             lines = s.strip().split("\n")
             return "\n".join([line.strip().lstrip("|") for line in lines])
 
+        values = input_data.prompt_values
+        if values:
+            input_data.prompt = input_data.prompt.format(**values)
+            input_data.sys_prompt = input_data.sys_prompt.format(**values)
+
         if input_data.sys_prompt:
             prompt.append({"role": "system", "content": input_data.sys_prompt})
 
@@ -197,7 +205,7 @@ class AIStructuredResponseGeneratorBlock(Block):
             except Exception as e:
                 return {}, f"JSON decode error: {e}"
 
-        logger.warning(f"LLM request: {prompt}")
+        logger.info(f"LLM request: {prompt}")
         retry_prompt = ""
         model = input_data.model
         api_key = (
@@ -213,7 +221,7 @@ class AIStructuredResponseGeneratorBlock(Block):
                     prompt=prompt,
                     json_format=bool(input_data.expected_format),
                 )
-                logger.warning(f"LLM attempt-{retry_count} response: {response_text}")
+                logger.info(f"LLM attempt-{retry_count} response: {response_text}")
 
                 if input_data.expected_format:
                     parsed_dict, parsed_error = parse_response(response_text)
@@ -252,6 +260,9 @@ class AITextGeneratorBlock(Block):
         api_key: BlockSecret = SecretField(value="")
         sys_prompt: str = ""
         retry: int = 3
+        prompt_values: dict[str, str] = SchemaField(
+            advanced=False, default={}, description="Values used to fill in the prompt."
+        )
 
     class Output(BlockSchema):
         response: str
@@ -427,7 +438,7 @@ class Message(BlockSchema):
 class AIConversationBlock(Block):
     class Input(BlockSchema):
         messages: List[Message] = SchemaField(
-            description="List of messages in the conversation.", min_items=1
+            description="List of messages in the conversation.", min_length=1
         )
         model: LlmModel = SchemaField(
             default=LlmModel.GPT4_TURBO,

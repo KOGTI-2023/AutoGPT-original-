@@ -17,6 +17,11 @@ import { IconToyBrick } from "@/components/ui/icons";
 import SchemaTooltip from "@/components/SchemaTooltip";
 import { getPrimaryCategoryColor } from "@/lib/utils";
 import { Badge } from "@/components/ui/badge";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 
 interface BlocksControlProps {
   blocks: Block[];
@@ -60,22 +65,25 @@ export const BlocksControl: React.FC<BlocksControlProps> = ({
 
   return (
     <Popover open={pinBlocksPopover ? true : undefined}>
-      {" "}
-      {/* Control popover open state */}
-      <PopoverTrigger asChild>
-        <Button
-          variant="ghost"
-          size="icon"
-          data-id="blocks-control-popover-trigger"
-        >
-          <IconToyBrick />
-        </Button>
-      </PopoverTrigger>
+      <Tooltip delayDuration={500}>
+        <TooltipTrigger asChild>
+          <PopoverTrigger asChild>
+            <Button
+              variant="ghost"
+              size="icon"
+              data-id="blocks-control-popover-trigger"
+            >
+              <IconToyBrick />
+            </Button>
+          </PopoverTrigger>
+        </TooltipTrigger>
+        <TooltipContent side="right">Blocks</TooltipContent>
+      </Tooltip>
       <PopoverContent
         side="right"
         sideOffset={22}
         align="start"
-        className="w-96 p-0"
+        className="w-[30rem] p-0"
         data-id="blocks-control-popover-content"
       >
         <Card className="border-none shadow-md">
