@@ -1,16 +1,16 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {{ include "autogpt-market.fullname" . }}
+  name: {{ include "autogpt-server.fullname" . }}-executor
   labels:
-    {{- include "autogpt-market.labels" . | nindent 4 }}
+    app.kubernetes.io/component: executor
 spec:
   {{- if not .Values.autoscaling.enabled }}
   replicas: {{ .Values.replicaCount }}
   {{- end }}
   selector:
     matchLabels:
-      {{- include "autogpt-market.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: executor
   template:
     metadata:
       {{- with .Values.podAnnotations }}
@@ -18,7 +18,7 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       labels:
-        {{- include "autogpt-market.labels" . | nindent 8 }}
+        app.kubernetes.io/component: executor
         {{- with .Values.podLabels }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
@@ -27,26 +27,23 @@ spec:
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      serviceAccountName: {{ include "autogpt-market.serviceAccountName" . }}
+      serviceAccountName: {{ include "autogpt-server.serviceAccountName" . }}
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
       containers:
         - name: {{ .Chart.Name }}
           envFrom:
             - configMapRef:
-                name: {{ include "autogpt-market.fullname" . }}-config
+                name: {{ include "autogpt-server.fullname" . }}-config
           securityContext:
             {{- toYaml .Values.securityContext | nindent 12 }}
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["poetry", "run", "executor"]
           ports:
             - name: http
-              containerPort: {{ .Values.service.targetPort }}
+              containerPort: {{ .Values.serviceExecutor.port }}
               protocol: TCP
-          livenessProbe:
-            {{- toYaml .Values.livenessProbe | nindent 12 }}
-          readinessProbe:
-            {{- toYaml .Values.readinessProbe | nindent 12 }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
           {{- with .Values.volumeMounts }}
