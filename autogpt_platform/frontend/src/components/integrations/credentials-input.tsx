@@ -1,14 +1,20 @@
 import { z } from "zod";
-import { cn } from "@/lib/utils";
+import { beautifyString, cn } from "@/lib/utils";
 import { useForm } from "react-hook-form";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import SchemaTooltip from "@/components/SchemaTooltip";
 import useCredentials from "@/hooks/useCredentials";
 import { zodResolver } from "@hookform/resolvers/zod";
-import AutoGPTServerAPI from "@/lib/autogpt-server-api";
 import { NotionLogoIcon } from "@radix-ui/react-icons";
-import { FaDiscord, FaGithub, FaGoogle, FaMedium, FaKey } from "react-icons/fa";
+import {
+  FaDiscord,
+  FaGithub,
+  FaTwitter,
+  FaGoogle,
+  FaMedium,
+  FaKey,
+} from "react-icons/fa";
 import { FC, useMemo, useState } from "react";
 import {
   CredentialsMetaInput,
@@ -39,6 +45,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { useBackendAPI } from "@/lib/autogpt-server-api/context";
 
 const fallbackIcon = FaKey;
 
@@ -48,10 +55,12 @@ export const providerIcons: Record<
   React.FC<{ className?: string }>
 > = {
   anthropic: fallbackIcon,
+  e2b: fallbackIcon,
   github: FaGithub,
   google: FaGoogle,
   groq: fallbackIcon,
   notion: NotionLogoIcon,
+  nvidia: fallbackIcon,
   discord: FaDiscord,
   d_id: fallbackIcon,
   google_maps: FaGoogle,
@@ -63,10 +72,13 @@ export const providerIcons: Record<
   openweathermap: fallbackIcon,
   open_router: fallbackIcon,
   pinecone: fallbackIcon,
+  slant3d: fallbackIcon,
   replicate: fallbackIcon,
   fal: fallbackIcon,
   revid: fallbackIcon,
+  twitter: FaTwitter,
   unreal_speech: fallbackIcon,
+  exa: fallbackIcon,
   hubspot: fallbackIcon,
 };
 // --8<-- [end:ProviderIconsEmbed]
@@ -84,12 +96,13 @@ export type OAuthPopupResultMessage = { message_type: "oauth_popup_result" } & (
 );
 
 export const CredentialsInput: FC<{
+  selfKey: string;
   className?: string;
   selectedCredentials?: CredentialsMetaInput;
   onSelectCredentials: (newValue?: CredentialsMetaInput) => void;
-}> = ({ className, selectedCredentials, onSelectCredentials }) => {
-  const api = useMemo(() => new AutoGPTServerAPI(), []);
-  const credentials = useCredentials();
+}> = ({ selfKey, className, selectedCredentials, onSelectCredentials }) => {
+  const api = useBackendAPI();
+  const credentials = useCredentials(selfKey);
   const [isAPICredentialsModalOpen, setAPICredentialsModalOpen] =
     useState(false);
   const [isOAuth2FlowInProgress, setOAuth2FlowInProgress] = useState(false);
@@ -206,6 +219,7 @@ export const CredentialsInput: FC<{
     <>
       {supportsApiKey && (
         <APIKeyCredentialsModal
+          credentialsFieldName={selfKey}
           open={isAPICredentialsModalOpen}
           onClose={() => setAPICredentialsModalOpen(false)}
           onCredentialsCreate={(credsMeta) => {
@@ -239,7 +253,9 @@ export const CredentialsInput: FC<{
     return (
       <>
         <div className="mb-2 flex gap-1">
-          <span className="text-m green text-gray-900">Credentials</span>
+          <span className="text-m green text-gray-900">
+            {providerName} Credentials
+          </span>
           <SchemaTooltip description={schema.description} />
         </div>
         <div className={cn("flex flex-row space-x-2", className)}>
@@ -307,7 +323,12 @@ export const CredentialsInput: FC<{
   // Saved credentials exist
   return (
     <>
-      <span className="text-m green mb-0 text-gray-900">Credentials</span>
+      <div className="flex gap-1">
+        <span className="text-m green mb-0 text-gray-900">
+          {providerName} Credentials
+        </span>
+        <SchemaTooltip description={schema.description} />
+      </div>
       <Select value={selectedCredentials?.id} onValueChange={handleValueChange}>
         <SelectTrigger>
           <SelectValue placeholder={schema.placeholder} />
@@ -350,11 +371,12 @@ export const CredentialsInput: FC<{
 };
 
 export const APIKeyCredentialsModal: FC<{
+  credentialsFieldName: string;
   open: boolean;
   onClose: () => void;
   onCredentialsCreate: (creds: CredentialsMetaInput) => void;
-}> = ({ open, onClose, onCredentialsCreate }) => {
-  const credentials = useCredentials();
+}> = ({ credentialsFieldName, open, onClose, onCredentialsCreate }) => {
+  const credentials = useCredentials(credentialsFieldName);
 
   const formSchema = z.object({
     apiKey: z.string().min(1, "API Key is required"),

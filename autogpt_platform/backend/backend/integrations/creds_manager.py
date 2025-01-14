@@ -1,6 +1,7 @@
 import logging
 from contextlib import contextmanager
 from datetime import datetime
+from typing import TYPE_CHECKING
 
 from autogpt_libs.utils.synchronize import RedisKeyedMutex
 from redis.lock import Lock as RedisLock
@@ -8,9 +9,12 @@ from redis.lock import Lock as RedisLock
 from backend.data import redis
 from backend.data.model import Credentials
 from backend.integrations.credentials_store import IntegrationCredentialsStore
-from backend.integrations.oauth import HANDLERS_BY_NAME, BaseOAuthHandler
+from backend.integrations.oauth import HANDLERS_BY_NAME
 from backend.util.exceptions import MissingConfigError
 from backend.util.settings import Settings
+
+if TYPE_CHECKING:
+    from backend.integrations.oauth import BaseOAuthHandler
 
 logger = logging.getLogger(__name__)
 settings = Settings()
@@ -88,7 +92,7 @@ class IntegrationCredentialsManager:
 
                     fresh_credentials = oauth_handler.refresh_tokens(credentials)
                     self.store.update_creds(user_id, fresh_credentials)
-                    if _lock:
+                    if _lock and _lock.locked():
                         _lock.release()
 
                     credentials = fresh_credentials
@@ -140,7 +144,8 @@ class IntegrationCredentialsManager:
         try:
             yield
         finally:
-            lock.release()
+            if lock.locked():
+                lock.release()
 
     def release_all_locks(self):
         """Call this on process termination to ensure all locks are released"""
@@ -148,7 +153,7 @@ class IntegrationCredentialsManager:
         self.store.locks.release_all_locks()
 
 
-def _get_provider_oauth_handler(provider_name: str) -> BaseOAuthHandler:
+def _get_provider_oauth_handler(provider_name: str) -> "BaseOAuthHandler":
     if provider_name not in HANDLERS_BY_NAME:
         raise KeyError(f"Unknown provider '{provider_name}'")
 
