@@ -34,7 +34,7 @@ export default async function RootLayout({
   return (
     <html
       lang="en"
-      className={`${GeistSans.variable} ${GeistMono.variable} ${poppins.variable} ${inter.variable}`}
+      className={`${poppins.variable} ${GeistSans.variable} ${GeistMono.variable} ${inter.variable}`}
     >
       <body className={cn("antialiased transition-colors", inter.className)}>
         <Providers
@@ -44,12 +44,12 @@ export default async function RootLayout({
           // enableSystem
           disableTransitionOnChange
         >
-          <div className="flex min-h-screen flex-col items-center justify-center">
+          <div className="flex min-h-screen flex-col items-stretch justify-items-stretch">
             <Navbar
               links={[
                 {
                   name: "Marketplace",
-                  href: "/store",
+                  href: "/marketplace",
                 },
                 {
                   name: "Library",
@@ -66,7 +66,7 @@ export default async function RootLayout({
                     {
                       icon: IconType.Edit,
                       text: "Edit profile",
-                      href: "/store/profile",
+                      href: "/profile",
                     },
                   ],
                 },
@@ -75,7 +75,7 @@ export default async function RootLayout({
                     {
                       icon: IconType.LayoutDashboard,
                       text: "Creator Dashboard",
-                      href: "/store/dashboard",
+                      href: "/profile/dashboard",
                     },
                     {
                       icon: IconType.UploadCloud,
@@ -88,7 +88,7 @@ export default async function RootLayout({
                     {
                       icon: IconType.Settings,
                       text: "Settings",
-                      href: "/store/settings",
+                      href: "/profile/settings",
                     },
                   ],
                 },
@@ -102,7 +102,7 @@ export default async function RootLayout({
                 },
               ]}
             />
-            <main className="flex-1">{children}</main>
+            <main className="w-full flex-grow">{children}</main>
             <TallyPopupSimple />
           </div>
           <Toaster />
