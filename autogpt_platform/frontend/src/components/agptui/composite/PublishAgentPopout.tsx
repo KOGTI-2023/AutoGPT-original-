@@ -76,14 +76,12 @@ export const PublishAgentPopout: React.FC<PublishAgentPopoutProps> = ({
   const { toast } = useToast();
 
   React.useEffect(() => {
-    console.log("PublishAgentPopout Effect");
     setOpen(openPopout);
     setStep(inputStep);
     setPublishData(submissionData);
   }, [openPopout]); // eslint-disable-line react-hooks/exhaustive-deps
 
   React.useEffect(() => {
-    console.log("LoadMyAgents Effect");
     if (open) {
       const loadMyAgents = async () => {
         try {
@@ -130,7 +128,7 @@ export const PublishAgentPopout: React.FC<PublishAgentPopoutProps> = ({
       title: name,
       subheader: "",
       description: description,
-      thumbnailSrc: "",
+      thumbnailSrc: selectedAgentData?.agent_image || "",
       youtubeLink: "",
       category: "",
       slug: name.replace(/ /g, "-"),
@@ -157,7 +155,7 @@ export const PublishAgentPopout: React.FC<PublishAgentPopoutProps> = ({
     if (!subHeading) missingFields.push("Sub-heading");
     if (!description) missingFields.push("Description");
     if (!imageUrls.length) missingFields.push("Image");
-    if (!categories.length) missingFields.push("Categories");
+    if (!categories.filter(Boolean).length) missingFields.push("Categories");
 
     if (missingFields.length > 0) {
       toast({
@@ -168,6 +166,7 @@ export const PublishAgentPopout: React.FC<PublishAgentPopoutProps> = ({
       return;
     }
 
+    const filteredCategories = categories.filter(Boolean);
     setPublishData({
       name,
       sub_heading: subHeading,
@@ -177,7 +176,7 @@ export const PublishAgentPopout: React.FC<PublishAgentPopoutProps> = ({
       agent_id: selectedAgentId || "",
       agent_version: selectedAgentVersion || 0,
       slug,
-      categories,
+      categories: filteredCategories,
     });
 
     // Create store submission
@@ -191,9 +190,8 @@ export const PublishAgentPopout: React.FC<PublishAgentPopoutProps> = ({
         agent_id: selectedAgentId || "",
         agent_version: selectedAgentVersion || 0,
         slug: slug.replace(/\s+/g, "-"),
-        categories: categories,
+        categories: filteredCategories,
       });
-      console.log("Store submission created:", submission);
     } catch (error) {
       console.error("Error creating store submission:", error);
     }
@@ -217,13 +215,20 @@ export const PublishAgentPopout: React.FC<PublishAgentPopoutProps> = ({
               <div className="h-full overflow-y-auto">
                 <PublishAgentSelect
                   agents={
-                    myAgents?.agents.map((agent) => ({
-                      name: agent.agent_name,
-                      id: agent.agent_id,
-                      version: agent.agent_version,
-                      lastEdited: agent.last_edited,
-                      imageSrc: "https://picsum.photos/300/200", // Fallback image if none provided
-                    })) || []
+                    myAgents?.agents
+                      .map((agent) => ({
+                        name: agent.agent_name,
+                        id: agent.agent_id,
+                        version: agent.agent_version,
+                        lastEdited: agent.last_edited,
+                        imageSrc:
+                          agent.agent_image || "https://picsum.photos/300/200",
+                      }))
+                      .sort(
+                        (a, b) =>
+                          new Date(b.lastEdited).getTime() -
+                          new Date(a.lastEdited).getTime(),
+                      ) || []
                   }
                   onSelect={handleAgentSelect}
                   onCancel={handleClose}

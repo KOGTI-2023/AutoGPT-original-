@@ -1,20 +1,16 @@
-import React from "react";
+import React, { Suspense } from "react";
 import type { Metadata } from "next";
-import { Inter, Poppins } from "next/font/google";
-import { Providers } from "@/app/providers";
-import { cn } from "@/lib/utils";
-import { Navbar } from "@/components/agptui/Navbar";
-
-import "./globals.css";
-import TallyPopupSimple from "@/components/TallyPopup";
-import { GoogleAnalytics } from "@next/third-parties/google";
-import { Toaster } from "@/components/ui/toaster";
-import { IconType } from "@/components/ui/icons";
+import { Poppins } from "next/font/google";
 import { GeistSans } from "geist/font/sans";
 import { GeistMono } from "geist/font/mono";
 
-// Fonts
-const inter = Inter({ subsets: ["latin"], variable: "--font-inter" });
+import "./globals.css";
+
+import { Toaster } from "@/components/ui/toaster";
+import { Providers } from "@/app/providers";
+import TallyPopupSimple from "@/components/TallyPopup";
+import { GoogleAnalytics } from "@/components/analytics/google-analytics";
+
 const poppins = Poppins({
   subsets: ["latin"],
   weight: ["400", "500", "600", "700"],
@@ -22,7 +18,7 @@ const poppins = Poppins({
 });
 
 export const metadata: Metadata = {
-  title: "NextGen AutoGPT",
+  title: "AutoGPT Platform",
   description: "Your one stop shop to creating AI Agents",
 };
 
@@ -34,9 +30,14 @@ export default async function RootLayout({
   return (
     <html
       lang="en"
-      className={`${poppins.variable} ${GeistSans.variable} ${GeistMono.variable} ${inter.variable}`}
+      className={`${poppins.variable} ${GeistSans.variable} ${GeistMono.variable}`}
     >
-      <body className={cn("antialiased transition-colors", inter.className)}>
+      <head>
+        <GoogleAnalytics
+          gaId={process.env.GA_MEASUREMENT_ID || "G-FH2XK2W4GN"} // This is the measurement Id for the Google Analytics dev project
+        />
+      </head>
+      <body>
         <Providers
           attribute="class"
           defaultTheme="light"
@@ -45,73 +46,12 @@ export default async function RootLayout({
           disableTransitionOnChange
         >
           <div className="flex min-h-screen flex-col items-stretch justify-items-stretch">
-            <Navbar
-              links={[
-                {
-                  name: "Marketplace",
-                  href: "/marketplace",
-                },
-                {
-                  name: "Library",
-                  href: "/monitoring",
-                },
-                {
-                  name: "Build",
-                  href: "/build",
-                },
-              ]}
-              menuItemGroups={[
-                {
-                  items: [
-                    {
-                      icon: IconType.Edit,
-                      text: "Edit profile",
-                      href: "/profile",
-                    },
-                  ],
-                },
-                {
-                  items: [
-                    {
-                      icon: IconType.LayoutDashboard,
-                      text: "Creator Dashboard",
-                      href: "/profile/dashboard",
-                    },
-                    {
-                      icon: IconType.UploadCloud,
-                      text: "Publish an agent",
-                    },
-                  ],
-                },
-                {
-                  items: [
-                    {
-                      icon: IconType.Settings,
-                      text: "Settings",
-                      href: "/profile/settings",
-                    },
-                  ],
-                },
-                {
-                  items: [
-                    {
-                      icon: IconType.LogOut,
-                      text: "Log out",
-                    },
-                  ],
-                },
-              ]}
-            />
-            <main className="w-full flex-grow">{children}</main>
+            {children}
             <TallyPopupSimple />
           </div>
           <Toaster />
         </Providers>
       </body>
-
-      <GoogleAnalytics
-        gaId={process.env.GA_MEASUREMENT_ID || "G-FH2XK2W4GN"} // This is the measurement Id for the Google Analytics dev project
-      />
     </html>
   );
 }

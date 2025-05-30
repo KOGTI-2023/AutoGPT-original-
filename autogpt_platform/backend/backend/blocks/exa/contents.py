@@ -49,8 +49,9 @@ class ExaContentsBlock(Block):
     class Output(BlockSchema):
         results: list = SchemaField(
             description="List of document contents",
-            default=[],
+            default_factory=list,
         )
+        error: str = SchemaField(description="Error message if the request failed")
 
     def __init__(self):
         super().__init__(
@@ -84,4 +85,3 @@ class ExaContentsBlock(Block):
             yield "results", data.get("results", [])
         except Exception as e:
             yield "error", str(e)
-            yield "results", []

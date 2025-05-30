@@ -2,40 +2,71 @@
 import React, { useCallback, useMemo, useState } from "react";
 
 import { useBackendAPI } from "@/lib/autogpt-server-api/context";
-import { GraphMeta } from "@/lib/autogpt-server-api";
+import { GraphExecutionID, GraphMeta } from "@/lib/autogpt-server-api";
 
+import type { ButtonAction } from "@/components/agptui/types";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Button, ButtonProps } from "@/components/agptui/Button";
-import { Input } from "@/components/ui/input";
+import { CredentialsInput } from "@/components/integrations/credentials-input";
+import { TypeBasedInput } from "@/components/type-based-input";
+import { useToastOnFail } from "@/components/ui/use-toast";
+import ActionButtonGroup from "@/components/agptui/action-button-group";
+import SchemaTooltip from "@/components/SchemaTooltip";
+import { IconPlay } from "@/components/ui/icons";
+import { useOnboarding } from "../onboarding/onboarding-provider";
 
 export default function AgentRunDraftView({
-  agent,
+  graph,
   onRun,
   agentActions,
 }: {
-  agent: GraphMeta;
-  onRun: (runID: string) => void;
-  agentActions: { label: string; callback: () => void }[];
+  graph: GraphMeta;
+  onRun: (runID: GraphExecutionID) => void;
+  agentActions: ButtonAction[];
 }): React.ReactNode {
   const api = useBackendAPI();
+  const toastOnFail = useToastOnFail();
 
-  const agentInputs = agent.input_schema.properties;
+  const agentInputs = graph.input_schema.properties;
+  const agentCredentialsInputs = graph.credentials_input_schema.properties;
   const [inputValues, setInputValues] = useState<Record<string, any>>({});
-
-  const doRun = useCallback(
-    () =>
-      api
-        .executeGraph(agent.id, agent.version, inputValues)
-        .then((newRun) => onRun(newRun.graph_exec_id)),
-    [api, agent, inputValues, onRun],
+  const [inputCredentials, setInputCredentials] = useState<Record<string, any>>(
+    {},
   );
+  const { state, completeStep } = useOnboarding();
 
-  const runActions: {
-    label: string;
-    variant?: ButtonProps["variant"];
-    callback: () => void;
-  }[] = useMemo(
-    () => [{ label: "Run", variant: "accent", callback: () => doRun() }],
+  const doRun = useCallback(() => {
+    api
+      .executeGraph(graph.id, graph.version, inputValues, inputCredentials)
+      .then((newRun) => onRun(newRun.graph_exec_id))
+      .catch(toastOnFail("execute agent"));
+    // Mark run agent onboarding step as completed
+    if (state?.completedSteps.includes("MARKETPLACE_ADD_AGENT")) {
+      completeStep("MARKETPLACE_RUN_AGENT");
+    }
+  }, [
+    api,
+    graph,
+    inputValues,
+    inputCredentials,
+    onRun,
+    toastOnFail,
+    state,
+    completeStep,
+  ]);
+
+  const runActions: ButtonAction[] = useMemo(
+    () => [
+      {
+        label: (
+          <>
+            <IconPlay className="mr-2 size-5" />
+            Run
+          </>
+        ),
+        variant: "accent",
+        callback: doRun,
+      },
+    ],
     [doRun],
   );
 
@@ -47,19 +78,42 @@ export default function AgentRunDraftView({
             <CardTitle className="font-poppins text-lg">Input</CardTitle>
           </CardHeader>
           <CardContent className="flex flex-col gap-4">
-            {Object.entries(agentInputs).map(([key, inputSubSchema]) => (
-              <div key={key} className="flex flex-col gap-1.5">
-                <label className="text-sm font-medium">
-                  {inputSubSchema.title || key}
-                </label>
-                <Input
-                  // TODO: render specific inputs based on input types
-                  defaultValue={
-                    "default" in inputSubSchema ? inputSubSchema.default : ""
+            {/* Credentials inputs */}
+            {Object.entries(agentCredentialsInputs).map(
+              ([key, inputSubSchema]) => (
+                <CredentialsInput
+                  key={key}
+                  schema={{ ...inputSubSchema, discriminator: undefined }}
+                  selectedCredentials={
+                    inputCredentials[key] ?? inputSubSchema.default
                   }
-                  className="rounded-full"
-                  onChange={(e) =>
-                    setInputValues((obj) => ({ ...obj, [key]: e.target.value }))
+                  onSelectCredentials={(value) =>
+                    setInputCredentials((obj) => ({
+                      ...obj,
+                      [key]: value,
+                    }))
+                  }
+                />
+              ),
+            )}
+
+            {/* Regular inputs */}
+            {Object.entries(agentInputs).map(([key, inputSubSchema]) => (
+              <div key={key} className="flex flex-col space-y-2">
+                <label className="flex items-center gap-1 text-sm font-medium">
+                  {inputSubSchema.title || key}
+                  <SchemaTooltip description={inputSubSchema.description} />
+                </label>
+
+                <TypeBasedInput
+                  schema={inputSubSchema}
+                  value={inputValues[key] ?? inputSubSchema.default}
+                  placeholder={inputSubSchema.description}
+                  onChange={(value) =>
+                    setInputValues((obj) => ({
+                      ...obj,
+                      [key]: value,
+                    }))
                   }
                 />
               </div>
@@ -71,27 +125,9 @@ export default function AgentRunDraftView({
       {/* Actions */}
       <aside className="w-48 xl:w-56">
         <div className="flex flex-col gap-8">
-          <div className="flex flex-col gap-3">
-            <h3 className="text-sm font-medium">Run actions</h3>
-            {runActions.map((action, i) => (
-              <Button
-                key={i}
-                variant={action.variant ?? "outline"}
-                onClick={action.callback}
-              >
-                {action.label}
-              </Button>
-            ))}
-          </div>
+          <ActionButtonGroup title="Run actions" actions={runActions} />
 
-          <div className="flex flex-col gap-3">
-            <h3 className="text-sm font-medium">Agent actions</h3>
-            {agentActions.map((action, i) => (
-              <Button key={i} variant="outline" onClick={action.callback}>
-                {action.label}
-              </Button>
-            ))}
-          </div>
+          <ActionButtonGroup title="Agent actions" actions={agentActions} />
         </div>
       </aside>
     </div>

@@ -17,9 +17,7 @@ const config = {
         sans: ["var(--font-geist-sans)"],
         mono: ["var(--font-geist-mono)"],
         // Include the custom font family
-        neue: ['"PP Neue Montreal TT"', "sans-serif"],
         poppins: ["var(--font-poppins)"],
-        inter: ["var(--font-inter)"],
       },
       colors: {
         border: "hsl(var(--border))",
@@ -117,6 +115,9 @@ const config = {
         // Add a full radius for pill-shaped buttons
         full: "9999px",
       },
+      boxShadow: {
+        subtle: "0px 1px 2px 0px rgba(0,0,0,0.05)",
+      },
       keyframes: {
         "accordion-down": {
           from: { height: "0" },
@@ -126,10 +127,18 @@ const config = {
           from: { height: "var(--radix-accordion-content-height)" },
           to: { height: "0" },
         },
+        "fade-in": {
+          "0%": { opacity: "0" }, // Start with opacity 0
+          "100%": { opacity: "1" }, // End with opacity 1
+        },
       },
       animation: {
         "accordion-down": "accordion-down 0.2s ease-out",
         "accordion-up": "accordion-up 0.2s ease-out",
+        "fade-in": "fade-in 0.2s ease-out",
+      },
+      transitionDuration: {
+        "2000": "2000ms",
       },
     },
   },

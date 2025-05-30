@@ -1,28 +1,37 @@
 "use client";
 import React, { useCallback, useMemo } from "react";
 
-import { BlockIOSubType, GraphMeta, Schedule } from "@/lib/autogpt-server-api";
+import {
+  GraphExecutionID,
+  GraphMeta,
+  Schedule,
+} from "@/lib/autogpt-server-api";
 import { useBackendAPI } from "@/lib/autogpt-server-api/context";
 
+import type { ButtonAction } from "@/components/agptui/types";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { AgentRunStatus } from "@/components/agents/agent-run-status-chip";
-import { Button } from "@/components/agptui/Button";
+import { useToastOnFail } from "@/components/ui/use-toast";
+import ActionButtonGroup from "@/components/agptui/action-button-group";
+import LoadingBox from "@/components/ui/loading";
 import { Input } from "@/components/ui/input";
 
 export default function AgentScheduleDetailsView({
-  agent,
+  graph,
   schedule,
   onForcedRun,
   agentActions,
 }: {
-  agent: GraphMeta;
+  graph: GraphMeta;
   schedule: Schedule;
-  onForcedRun: (runID: string) => void;
-  agentActions: { label: string; callback: () => void }[];
+  onForcedRun: (runID: GraphExecutionID) => void;
+  agentActions: ButtonAction[];
 }): React.ReactNode {
   const api = useBackendAPI();
 
   const selectedRunStatus: AgentRunStatus = "scheduled";
+
+  const toastOnFail = useToastOnFail();
 
   const infoStats: { label: string; value: React.ReactNode }[] = useMemo(() => {
     return [
@@ -50,23 +59,24 @@ export default function AgentScheduleDetailsView({
       Object.entries(schedule.input_data).map(([k, v]) => [
         k,
         {
-          title: agent.input_schema.properties[k].title,
+          title: graph.input_schema.properties[k].title,
           /* TODO: type: agent.input_schema.properties[k].type */
           value: v,
         },
       ]),
     );
-  }, [agent, schedule]);
+  }, [graph, schedule]);
 
   const runNow = useCallback(
     () =>
       api
-        .executeGraph(agent.id, agent.version, schedule.input_data)
-        .then((run) => onForcedRun(run.graph_exec_id)),
-    [api, agent, schedule, onForcedRun],
+        .executeGraph(graph.id, graph.version, schedule.input_data)
+        .then((run) => onForcedRun(run.graph_exec_id))
+        .catch(toastOnFail("execute agent")),
+    [api, graph, schedule, onForcedRun, toastOnFail],
   );
 
-  const runActions: { label: string; callback: () => void }[] = useMemo(
+  const runActions: ButtonAction[] = useMemo(
     () => [{ label: "Run now", callback: () => runNow() }],
     [runNow],
   );
@@ -100,15 +110,11 @@ export default function AgentScheduleDetailsView({
               Object.entries(agentRunInputs).map(([key, { title, value }]) => (
                 <div key={key} className="flex flex-col gap-1.5">
                   <label className="text-sm font-medium">{title || key}</label>
-                  <Input
-                    defaultValue={value}
-                    className="rounded-full"
-                    disabled
-                  />
+                  <Input value={value} className="rounded-full" disabled />
                 </div>
               ))
             ) : (
-              <p>Loading...</p>
+              <LoadingBox spinnerSize={12} className="h-24" />
             )}
           </CardContent>
         </Card>
@@ -117,23 +123,9 @@ export default function AgentScheduleDetailsView({
       {/* Run / Agent Actions */}
       <aside className="w-48 xl:w-56">
         <div className="flex flex-col gap-8">
-          <div className="flex flex-col gap-3">
-            <h3 className="text-sm font-medium">Run actions</h3>
-            {runActions.map((action, i) => (
-              <Button key={i} variant="outline" onClick={action.callback}>
-                {action.label}
-              </Button>
-            ))}
-          </div>
+          <ActionButtonGroup title="Run actions" actions={runActions} />
 
-          <div className="flex flex-col gap-3">
-            <h3 className="text-sm font-medium">Agent actions</h3>
-            {agentActions.map((action, i) => (
-              <Button key={i} variant="outline" onClick={action.callback}>
-                {action.label}
-              </Button>
-            ))}
-          </div>
+          <ActionButtonGroup title="Agent actions" actions={agentActions} />
         </div>
       </aside>
     </div>

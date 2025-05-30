@@ -9,25 +9,31 @@ from .type import type_match
 
 
 def to_dict(data) -> dict:
+    if isinstance(data, BaseModel):
+        data = data.model_dump()
     return jsonable_encoder(data)
 
 
 def dumps(data) -> str:
-    return json.dumps(jsonable_encoder(data))
+    return json.dumps(to_dict(data))
 
 
 T = TypeVar("T")
 
 
 @overload
-def loads(data: str, *args, target_type: Type[T], **kwargs) -> T: ...
+def loads(data: str | bytes, *args, target_type: Type[T], **kwargs) -> T: ...
 
 
 @overload
-def loads(data: str, *args, **kwargs) -> Any: ...
+def loads(data: str | bytes, *args, **kwargs) -> Any: ...
 
 
-def loads(data: str, *args, target_type: Type[T] | None = None, **kwargs) -> Any:
+def loads(
+    data: str | bytes, *args, target_type: Type[T] | None = None, **kwargs
+) -> Any:
+    if isinstance(data, bytes):
+        data = data.decode("utf-8")
     parsed = json.loads(data, *args, **kwargs)
     if target_type:
         return type_match(parsed, target_type)

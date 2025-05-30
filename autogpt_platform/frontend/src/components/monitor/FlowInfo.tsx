@@ -2,7 +2,6 @@ import React, { useEffect, useState, useCallback } from "react";
 import {
   GraphExecutionMeta,
   Graph,
-  safeCopyGraph,
   BlockUIType,
   BlockIORootSchema,
   LibraryAgent,
@@ -18,11 +17,16 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Button, buttonVariants } from "@/components/ui/button";
-import { ClockIcon, ExitIcon, Pencil2Icon } from "@radix-ui/react-icons";
+import {
+  ClockIcon,
+  ExitIcon,
+  Pencil2Icon,
+  PlayIcon,
+  TrashIcon,
+} from "@radix-ui/react-icons";
 import Link from "next/link";
 import { exportAsJSONFile, filterBlocksByType } from "@/lib/utils";
 import { FlowRunsStats } from "@/components/monitor/index";
-import { Trash2Icon } from "lucide-react";
 import {
   Dialog,
   DialogContent,
@@ -44,27 +48,8 @@ export const FlowInfo: React.FC<
     refresh: () => void;
   }
 > = ({ flow, executions, flowVersion, refresh, ...props }) => {
-  const {
-    agentName,
-    setAgentName,
-    agentDescription,
-    setAgentDescription,
-    savedAgent,
-    availableNodes,
-    availableFlows,
-    getOutputType,
-    requestSave,
-    requestSaveAndRun,
-    requestStopRun,
-    scheduleRunner,
-    isRunning,
-    isScheduling,
-    setIsScheduling,
-    nodes,
-    setNodes,
-    edges,
-    setEdges,
-  } = useAgentGraph(flow.agent_id, flow.agent_version, undefined, false);
+  const { requestSaveAndRun, requestStopRun, isRunning, nodes, setNodes } =
+    useAgentGraph(flow.graph_id, flow.graph_version, undefined, false);
 
   const api = useBackendAPI();
   const { toast } = useToast();
@@ -76,11 +61,10 @@ export const FlowInfo: React.FC<
   const selectedFlowVersion: Graph | undefined = flowVersions?.find(
     (v) =>
       v.version ==
-      (selectedVersion == "all" ? flow.agent_version : selectedVersion),
+      (selectedVersion == "all" ? flow.graph_version : selectedVersion),
   );
 
   const [isDeleteModalOpen, setIsDeleteModalOpen] = useState(false);
-  const [openCron, setOpenCron] = useState(false);
   const [isRunnerInputOpen, setIsRunnerInputOpen] = useState(false);
   const isDisabled = !selectedFlowVersion;
 
@@ -105,9 +89,6 @@ export const FlowInfo: React.FC<
         value: (node.data.hardcodedValues as any).value,
         placeholder_values:
           (node.data.hardcodedValues as any).placeholder_values || [],
-        limit_to_placeholder_values:
-          (node.data.hardcodedValues as any).limit_to_placeholder_values ||
-          false,
       },
     }));
 
@@ -127,22 +108,11 @@ export const FlowInfo: React.FC<
     return { inputs, outputs };
   }, [nodes]);
 
-  const handleScheduleButton = () => {
-    if (!selectedFlowVersion) {
-      toast({
-        title: "Please select a flow version before scheduling",
-        duration: 2000,
-      });
-      return;
-    }
-    setOpenCron(true);
-  };
-
   useEffect(() => {
     api
-      .getGraphAllVersions(flow.agent_id)
+      .getGraphAllVersions(flow.graph_id)
       .then((result) => setFlowVersions(result));
-  }, [flow.agent_id, api]);
+  }, [flow.graph_id, api]);
 
   const openRunnerInput = () => setIsRunnerInputOpen(true);
 
@@ -156,7 +126,7 @@ export const FlowInfo: React.FC<
   };
 
   const handleInputChange = useCallback(
-    (nodeId: string, field: string, value: string) => {
+    (nodeId: string, field: string, value: any) => {
       setNodes((nds) =>
         nds.map((node) => {
           if (node.id === nodeId) {
@@ -180,14 +150,11 @@ export const FlowInfo: React.FC<
 
   return (
     <Card {...props}>
-      <CardHeader className="flex-row justify-between space-x-3 space-y-0">
-        <div>
-          <CardTitle>
-            {flow.name}{" "}
-            <span className="font-light">v{flow.agent_version}</span>
-          </CardTitle>
-        </div>
-        <div className="flex items-start space-x-2">
+      <CardHeader className="">
+        <CardTitle>
+          {flow.name} <span className="font-light">v{flow.graph_version}</span>
+        </CardTitle>
+        <div className="flex flex-col space-y-2 py-6">
           {(flowVersions?.length ?? 0) > 1 && (
             <DropdownMenu>
               <DropdownMenuTrigger asChild>
@@ -225,32 +192,35 @@ export const FlowInfo: React.FC<
               </DropdownMenuContent>
             </DropdownMenu>
           )}
-          <Link
-            className={buttonVariants({ variant: "default" })}
-            href={`/build?flowID=${flow.agent_id}&flowVersion=${flow.agent_version}`}
-          >
-            <Pencil2Icon className="mr-2" />
-            Open in Builder
-          </Link>
-          <Button
-            variant="outline"
-            className="px-2.5"
-            title="Export to a JSON-file"
-            data-testid="export-button"
-            onClick={async () =>
-              exportAsJSONFile(
-                safeCopyGraph(
-                  flowVersions!.find(
-                    (v) => v.version == selectedFlowVersion!.version,
-                  )!,
-                  await api.getBlocks(),
-                ),
-                `${flow.name}_v${selectedFlowVersion!.version}.json`,
-              )
-            }
-          >
-            <ExitIcon className="mr-2" /> Export
-          </Button>
+          {flow.can_access_graph && (
+            <Link
+              className={buttonVariants({ variant: "default" })}
+              href={`/build?flowID=${flow.graph_id}&flowVersion=${flow.graph_version}`}
+            >
+              <Pencil2Icon className="mr-2" />
+              Open in Builder
+            </Link>
+          )}
+          {flow.can_access_graph && (
+            <Button
+              variant="outline"
+              className="px-2.5"
+              title="Export to a JSON-file"
+              data-testid="export-button"
+              onClick={() =>
+                api
+                  .getGraph(flow.graph_id, selectedFlowVersion!.version, true)
+                  .then((graph) =>
+                    exportAsJSONFile(
+                      graph,
+                      `${flow.name}_v${selectedFlowVersion!.version}.json`,
+                    ),
+                  )
+              }
+            >
+              <ExitIcon className="mr-2" /> Export
+            </Button>
+          )}
           <Button
             variant="secondary"
             className="bg-purple-500 text-white hover:bg-purple-700"
@@ -258,15 +228,19 @@ export const FlowInfo: React.FC<
             disabled={isDisabled}
             title={!isRunning ? "Run Agent" : "Stop Agent"}
           >
+            <PlayIcon className="mr-2" />
             {isRunning ? "Stop Agent" : "Run Agent"}
           </Button>
-          <Button
-            variant="outline"
-            onClick={() => setIsDeleteModalOpen(true)}
-            data-testid="delete-button"
-          >
-            <Trash2Icon className="h-full" />
-          </Button>
+          {flow.can_access_graph && (
+            <Button
+              variant="destructive"
+              onClick={() => setIsDeleteModalOpen(true)}
+              data-testid="delete-button"
+            >
+              <TrashIcon className="mr-2" />
+              Delete Agent
+            </Button>
+          )}
         </div>
       </CardHeader>
       <CardContent>
@@ -274,7 +248,7 @@ export const FlowInfo: React.FC<
           flows={[flow]}
           executions={executions.filter(
             (execution) =>
-              execution.graph_id == flow.agent_id &&
+              execution.graph_id == flow.graph_id &&
               (selectedVersion == "all" ||
                 execution.graph_version == selectedVersion),
           )}
@@ -299,10 +273,12 @@ export const FlowInfo: React.FC<
             <Button
               variant="destructive"
               onClick={() => {
-                api.deleteGraph(flow.agent_id).then(() => {
-                  setIsDeleteModalOpen(false);
-                  refresh();
-                });
+                api
+                  .updateLibraryAgent(flow.id, { is_deleted: true })
+                  .then(() => {
+                    setIsDeleteModalOpen(false);
+                    refresh();
+                  });
               }}
             >
               Delete

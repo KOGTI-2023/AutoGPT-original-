@@ -1,11 +1,12 @@
 "use client";
 import React, {
+  createContext,
   useState,
   useCallback,
   useEffect,
   useRef,
   MouseEvent,
-  createContext,
+  Suspense,
 } from "react";
 import {
   ReactFlow,
@@ -26,7 +27,12 @@ import {
 import "@xyflow/react/dist/style.css";
 import { CustomNode } from "./CustomNode";
 import "./flow.css";
-import { BlockUIType, formatEdgeID, GraphID } from "@/lib/autogpt-server-api";
+import {
+  BlockUIType,
+  formatEdgeID,
+  GraphExecutionID,
+  GraphID,
+} from "@/lib/autogpt-server-api";
 import { getTypeColor, findNewlyAddedBlockCoordinates } from "@/lib/utils";
 import { history } from "./history";
 import { CustomEdge } from "./CustomEdge";
@@ -43,6 +49,7 @@ import RunnerUIWrapper, {
   RunnerUIWrapperRef,
 } from "@/components/RunnerUIWrapper";
 import PrimaryActionBar from "@/components/PrimaryActionButton";
+import OttoChatWidget from "@/components/OttoChatWidget";
 import { useToast } from "@/components/ui/use-toast";
 import { useCopyPaste } from "../hooks/useCopyPaste";
 import { CronScheduler } from "./cronScheduler";
@@ -86,7 +93,9 @@ const FlowEditor: React.FC<{
   const [visualizeBeads, setVisualizeBeads] = useState<
     "no" | "static" | "animate"
   >("animate");
-  const [flowExecutionID, setFlowExecutionID] = useState<string | undefined>();
+  const [flowExecutionID, setFlowExecutionID] = useState<
+    GraphExecutionID | undefined
+  >();
   const {
     agentName,
     setAgentName,
@@ -140,6 +149,13 @@ const FlowEditor: React.FC<{
   // It stores the dimension of all nodes with position as well
   const [nodeDimensions, setNodeDimensions] = useState<NodeDimension>({});
 
+  // Set page title with or without graph name
+  useEffect(() => {
+    document.title = savedAgent
+      ? `${savedAgent.name} - Builder - AutoGPT Platform`
+      : `Builder - AutoGPT Platform`;
+  }, [savedAgent]);
+
   useEffect(() => {
     if (params.get("resetTutorial") === "true") {
       localStorage.removeItem(TUTORIAL_STORAGE_KEY);
@@ -164,7 +180,9 @@ const FlowEditor: React.FC<{
     if (params.get("open_scheduling") === "true") {
       setOpenCron(true);
     }
-    setFlowExecutionID(params.get("flowExecutionID") || undefined);
+    setFlowExecutionID(
+      (params.get("flowExecutionID") as GraphExecutionID) || undefined,
+    );
   }, [params]);
 
   useEffect(() => {
@@ -667,7 +685,7 @@ const FlowEditor: React.FC<{
           <Controls />
           <Background className="dark:bg-slate-800" />
           <ControlPanel
-            className="absolute z-10"
+            className="absolute z-20"
             controls={editorControls}
             topChildren={
               <BlocksControl
@@ -692,6 +710,7 @@ const FlowEditor: React.FC<{
             }
           ></ControlPanel>
           <PrimaryActionBar
+            className="absolute bottom-0 left-1/2 z-20 -translate-x-1/2"
             onClickAgentOutputs={() => runnerUIRef.current?.openRunnerOutput()}
             onClickRunAgent={() => {
               if (!savedAgent) {
@@ -731,6 +750,12 @@ const FlowEditor: React.FC<{
         scheduleRunner={scheduleRunner}
         requestSaveAndRun={requestSaveAndRun}
       />
+      <Suspense fallback={null}>
+        <OttoChatWidget
+          graphID={flowID}
+          className="fixed bottom-4 right-4 z-20"
+        />
+      </Suspense>
     </FlowContext.Provider>
   );
 };

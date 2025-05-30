@@ -2,7 +2,7 @@ import asyncio
 import logging
 from collections import defaultdict
 from datetime import datetime
-from typing import TYPE_CHECKING, Annotated, Any, Sequence
+from typing import Annotated, Any, Sequence
 
 import pydantic
 import stripe
@@ -10,12 +10,13 @@ from autogpt_libs.auth.middleware import auth_middleware
 from autogpt_libs.feature_flag.client import feature_flag
 from autogpt_libs.utils.cache import thread_cached
 from fastapi import APIRouter, Body, Depends, HTTPException, Request, Response
+from starlette.status import HTTP_204_NO_CONTENT, HTTP_404_NOT_FOUND
 from typing_extensions import Optional, TypedDict
 
-import backend.data.block
 import backend.server.integrations.router
 import backend.server.routers.analytics
 import backend.server.v2.library.db as library_db
+from backend.data import execution as execution_db
 from backend.data import graph as graph_db
 from backend.data.api_key import (
     APIKeyError,
@@ -29,26 +30,36 @@ from backend.data.api_key import (
     suspend_api_key,
     update_api_key_permissions,
 )
-from backend.data.block import BlockInput, CompletedBlockOutput
+from backend.data.block import BlockInput, CompletedBlockOutput, get_block, get_blocks
 from backend.data.credit import (
     AutoTopUpConfig,
     RefundRequest,
     TransactionHistory,
     get_auto_top_up,
     get_block_costs,
-    get_stripe_customer_id,
     get_user_credit_model,
     set_auto_top_up,
 )
+from backend.data.execution import AsyncRedisExecutionEventBus
+from backend.data.model import CredentialsMetaInput
 from backend.data.notifications import NotificationPreference, NotificationPreferenceDTO
+from backend.data.onboarding import (
+    UserOnboardingUpdate,
+    get_recommended_agents,
+    get_user_onboarding,
+    onboarding_enabled,
+    update_user_onboarding,
+)
+from backend.data.rabbitmq import AsyncRabbitMQ
 from backend.data.user import (
     get_or_create_user,
     get_user_notification_preference,
     update_user_email,
     update_user_notification_preference,
 )
-from backend.executor import ExecutionManager, ExecutionScheduler, scheduler
-from backend.integrations.creds_manager import IntegrationCredentialsManager
+from backend.executor import scheduler
+from backend.executor import utils as execution_utils
+from backend.executor.utils import create_execution_queue_config
 from backend.integrations.webhooks.graph_lifecycle_hooks import (
     on_graph_activate,
     on_graph_deactivate,
@@ -66,23 +77,26 @@ from backend.server.utils import get_user_id
 from backend.util.service import get_service_client
 from backend.util.settings import Settings
 
-if TYPE_CHECKING:
-    from backend.data.model import Credentials
+
+@thread_cached
+def execution_scheduler_client() -> scheduler.SchedulerClient:
+    return get_service_client(scheduler.SchedulerClient, health_check=False)
 
 
 @thread_cached
-def execution_manager_client() -> ExecutionManager:
-    return get_service_client(ExecutionManager)
+async def execution_queue_client() -> AsyncRabbitMQ:
+    client = AsyncRabbitMQ(create_execution_queue_config())
+    await client.connect()
+    return client
 
 
 @thread_cached
-def execution_scheduler_client() -> ExecutionScheduler:
-    return get_service_client(ExecutionScheduler)
+def execution_event_bus() -> AsyncRedisExecutionEventBus:
+    return AsyncRedisExecutionEventBus()
 
 
 settings = Settings()
 logger = logging.getLogger(__name__)
-integration_creds_manager = IntegrationCredentialsManager()
 
 _user_credit_model = get_user_credit_model()
 
@@ -151,15 +165,58 @@ async def update_preferences(
 
 
 ########################################################
+##################### Onboarding #######################
+########################################################
+
+
+@v1_router.get(
+    "/onboarding", tags=["onboarding"], dependencies=[Depends(auth_middleware)]
+)
+async def get_onboarding(user_id: Annotated[str, Depends(get_user_id)]):
+    return await get_user_onboarding(user_id)
+
+
+@v1_router.patch(
+    "/onboarding", tags=["onboarding"], dependencies=[Depends(auth_middleware)]
+)
+async def update_onboarding(
+    user_id: Annotated[str, Depends(get_user_id)], data: UserOnboardingUpdate
+):
+    return await update_user_onboarding(user_id, data)
+
+
+@v1_router.get(
+    "/onboarding/agents",
+    tags=["onboarding"],
+    dependencies=[Depends(auth_middleware)],
+)
+async def get_onboarding_agents(
+    user_id: Annotated[str, Depends(get_user_id)],
+):
+    return await get_recommended_agents(user_id)
+
+
+@v1_router.get(
+    "/onboarding/enabled",
+    tags=["onboarding", "public"],
+    dependencies=[Depends(auth_middleware)],
+)
+async def is_onboarding_enabled():
+    return await onboarding_enabled()
+
+
+########################################################
 ##################### Blocks ###########################
 ########################################################
 
 
 @v1_router.get(path="/blocks", tags=["blocks"], dependencies=[Depends(auth_middleware)])
 def get_graph_blocks() -> Sequence[dict[Any, Any]]:
-    blocks = [block() for block in backend.data.block.get_blocks().values()]
+    blocks = [block() for block in get_blocks().values()]
     costs = get_block_costs()
-    return [{**b.to_dict(), "costs": costs.get(b.id, [])} for b in blocks]
+    return [
+        {**b.to_dict(), "costs": costs.get(b.id, [])} for b in blocks if not b.disabled
+    ]
 
 
 @v1_router.post(
@@ -168,7 +225,7 @@ def get_graph_blocks() -> Sequence[dict[Any, Any]]:
     dependencies=[Depends(auth_middleware)],
 )
 def execute_graph_block(block_id: str, data: BlockInput) -> CompletedBlockOutput:
-    obj = backend.data.block.get_block(block_id)
+    obj = get_block(block_id)
     if not obj:
         raise HTTPException(status_code=404, detail=f"Block #{block_id} not found.")
 
@@ -257,7 +314,7 @@ async def configure_user_auto_top_up(
     dependencies=[Depends(auth_middleware)],
 )
 async def get_user_auto_top_up(
-    user_id: Annotated[str, Depends(get_user_id)]
+    user_id: Annotated[str, Depends(get_user_id)],
 ) -> AutoTopUpConfig:
     return await get_auto_top_up(user_id)
 
@@ -301,15 +358,7 @@ async def stripe_webhook(request: Request):
 async def manage_payment_method(
     user_id: Annotated[str, Depends(get_user_id)],
 ) -> dict[str, str]:
-    session = stripe.billing_portal.Session.create(
-        customer=await get_stripe_customer_id(user_id),
-        return_url=settings.config.frontend_base_url + "/profile/credits",
-    )
-    if not session:
-        raise HTTPException(
-            status_code=400, detail="Failed to create billing portal session"
-        )
-    return {"url": session.url}
+    return {"url": await _user_credit_model.create_billing_portal_session(user_id)}
 
 
 @v1_router.get(path="/credits/transactions", dependencies=[Depends(auth_middleware)])
@@ -332,7 +381,7 @@ async def get_credit_history(
 
 @v1_router.get(path="/credits/refunds", dependencies=[Depends(auth_middleware)])
 async def get_refund_requests(
-    user_id: Annotated[str, Depends(get_user_id)]
+    user_id: Annotated[str, Depends(get_user_id)],
 ) -> list[RefundRequest]:
     return await _user_credit_model.get_refund_requests(user_id)
 
@@ -348,7 +397,7 @@ class DeleteGraphResponse(TypedDict):
 
 @v1_router.get(path="/graphs", tags=["graphs"], dependencies=[Depends(auth_middleware)])
 async def get_graphs(
-    user_id: Annotated[str, Depends(get_user_id)]
+    user_id: Annotated[str, Depends(get_user_id)],
 ) -> Sequence[graph_db.GraphModel]:
     return await graph_db.get_graphs(filter_by="active", user_id=user_id)
 
@@ -365,10 +414,14 @@ async def get_graph(
     graph_id: str,
     user_id: Annotated[str, Depends(get_user_id)],
     version: int | None = None,
-    hide_credentials: bool = False,
+    for_export: bool = False,
 ) -> graph_db.GraphModel:
     graph = await graph_db.get_graph(
-        graph_id, version, user_id=user_id, for_export=hide_credentials
+        graph_id,
+        version,
+        user_id=user_id,
+        for_export=for_export,
+        include_subgraphs=True,  # needed to construct full credentials input schema
     )
     if not graph:
         raise HTTPException(status_code=404, detail=f"Graph #{graph_id} not found.")
@@ -393,24 +446,22 @@ async def get_graph_all_versions(
     path="/graphs", tags=["graphs"], dependencies=[Depends(auth_middleware)]
 )
 async def create_new_graph(
-    create_graph: CreateGraph, user_id: Annotated[str, Depends(get_user_id)]
+    create_graph: CreateGraph,
+    user_id: Annotated[str, Depends(get_user_id)],
 ) -> graph_db.GraphModel:
     graph = graph_db.make_graph_model(create_graph.graph, user_id)
     graph.reassign_ids(user_id=user_id, reassign_graph_id=True)
+    graph.validate_graph(for_run=False)
 
     graph = await graph_db.create_graph(graph, user_id=user_id)
 
     # Create a library agent for the new graph
-    await library_db.create_library_agent(
-        graph.id,
-        graph.version,
-        user_id,
+    library_agent = await library_db.create_library_agent(graph, user_id)
+    _ = asyncio.create_task(
+        library_db.add_generated_agent_image(graph, library_agent.id)
     )
 
-    graph = await on_graph_activate(
-        graph,
-        get_credentials=lambda id: integration_creds_manager.get(user_id, id),
-    )
+    graph = await on_graph_activate(graph, user_id=user_id)
     return graph
 
 
@@ -421,11 +472,7 @@ async def delete_graph(
     graph_id: str, user_id: Annotated[str, Depends(get_user_id)]
 ) -> DeleteGraphResponse:
     if active_version := await graph_db.get_graph(graph_id, user_id=user_id):
-
-        def get_credentials(credentials_id: str) -> "Credentials | None":
-            return integration_creds_manager.get(user_id, credentials_id)
-
-        await on_graph_deactivate(active_version, get_credentials)
+        await on_graph_deactivate(active_version, user_id=user_id)
 
     return {"version_counts": await graph_db.delete_graph(graph_id, user_id=user_id)}
 
@@ -449,17 +496,10 @@ async def update_graph(
     latest_version_number = max(g.version for g in existing_versions)
     graph.version = latest_version_number + 1
 
-    latest_version_graph = next(
-        v for v in existing_versions if v.version == latest_version_number
-    )
     current_active_version = next((v for v in existing_versions if v.is_active), None)
-    if latest_version_graph.is_template != graph.is_template:
-        raise HTTPException(
-            400, detail="Changing is_template on an existing graph is forbidden"
-        )
-    graph.is_active = not graph.is_template
     graph = graph_db.make_graph_model(graph, user_id)
-    graph.reassign_ids(user_id=user_id)
+    graph.reassign_ids(user_id=user_id, reassign_graph_id=False)
+    graph.validate_graph(for_run=False)
 
     new_graph_version = await graph_db.create_graph(graph, user_id=user_id)
 
@@ -469,24 +509,15 @@ async def update_graph(
             user_id, graph.id, graph.version
         )
 
-        def get_credentials(credentials_id: str) -> "Credentials | None":
-            return integration_creds_manager.get(user_id, credentials_id)
-
         # Handle activation of the new graph first to ensure continuity
-        new_graph_version = await on_graph_activate(
-            new_graph_version,
-            get_credentials=get_credentials,
-        )
+        new_graph_version = await on_graph_activate(new_graph_version, user_id=user_id)
         # Ensure new version is the only active version
         await graph_db.set_graph_active_version(
             graph_id=graph_id, version=new_graph_version.version, user_id=user_id
         )
         if current_active_version:
             # Handle deactivation of the previously active version
-            await on_graph_deactivate(
-                current_active_version,
-                get_credentials=get_credentials,
-            )
+            await on_graph_deactivate(current_active_version, user_id=user_id)
 
     return new_graph_version
 
@@ -510,14 +541,8 @@ async def set_graph_active_version(
 
     current_active_graph = await graph_db.get_graph(graph_id, user_id=user_id)
 
-    def get_credentials(credentials_id: str) -> "Credentials | None":
-        return integration_creds_manager.get(user_id, credentials_id)
-
     # Handle activation of the new graph first to ensure continuity
-    await on_graph_activate(
-        new_active_graph,
-        get_credentials=get_credentials,
-    )
+    await on_graph_activate(new_active_graph, user_id=user_id)
     # Ensure new version is the only active version
     await graph_db.set_graph_active_version(
         graph_id=graph_id,
@@ -532,10 +557,7 @@ async def set_graph_active_version(
 
     if current_active_graph and current_active_graph.version != new_active_version:
         # Handle deactivation of the previously active version
-        await on_graph_deactivate(
-            current_active_graph,
-            get_credentials=get_credentials,
-        )
+        await on_graph_deactivate(current_active_graph, user_id=user_id)
 
 
 @v1_router.post(
@@ -543,20 +565,25 @@ async def set_graph_active_version(
     tags=["graphs"],
     dependencies=[Depends(auth_middleware)],
 )
-def execute_graph(
+async def execute_graph(
     graph_id: str,
-    node_input: Annotated[dict[str, Any], Body(..., default_factory=dict)],
     user_id: Annotated[str, Depends(get_user_id)],
+    inputs: Annotated[dict[str, Any], Body(..., embed=True, default_factory=dict)],
+    credentials_inputs: Annotated[
+        dict[str, CredentialsMetaInput], Body(..., embed=True, default_factory=dict)
+    ],
     graph_version: Optional[int] = None,
+    preset_id: Optional[str] = None,
 ) -> ExecuteGraphResponse:
-    try:
-        graph_exec = execution_manager_client().add_execution(
-            graph_id, node_input, user_id=user_id, graph_version=graph_version
-        )
-        return ExecuteGraphResponse(graph_exec_id=graph_exec.graph_exec_id)
-    except Exception as e:
-        msg = str(e).encode().decode("unicode_escape")
-        raise HTTPException(status_code=400, detail=msg)
+    graph_exec = await execution_utils.add_graph_execution_async(
+        graph_id=graph_id,
+        user_id=user_id,
+        inputs=inputs,
+        preset_id=preset_id,
+        graph_version=graph_version,
+        graph_credentials_inputs=credentials_inputs,
+    )
+    return ExecuteGraphResponse(graph_exec_id=graph_exec.id)
 
 
 @v1_router.post(
@@ -566,24 +593,70 @@ def execute_graph(
 )
 async def stop_graph_run(
     graph_exec_id: str, user_id: Annotated[str, Depends(get_user_id)]
-) -> graph_db.GraphExecution:
-    if not await graph_db.get_execution_meta(
+) -> execution_db.GraphExecution:
+    if not await execution_db.get_graph_execution_meta(
         user_id=user_id, execution_id=graph_exec_id
     ):
         raise HTTPException(404, detail=f"Agent execution #{graph_exec_id} not found")
 
-    await asyncio.to_thread(
-        lambda: execution_manager_client().cancel_execution(graph_exec_id)
-    )
+    await _cancel_execution(graph_exec_id)
 
     # Retrieve & return canceled graph execution in its final state
-    result = await graph_db.get_execution(execution_id=graph_exec_id, user_id=user_id)
+    result = await execution_db.get_graph_execution(
+        execution_id=graph_exec_id, user_id=user_id
+    )
     if not result:
         raise HTTPException(
             500,
             detail=f"Could not fetch graph execution #{graph_exec_id} after stopping",
         )
     return result
+
+
+async def _cancel_execution(graph_exec_id: str):
+    """
+    Mechanism:
+    1. Set the cancel event
+    2. Graph executor's cancel handler thread detects the event, terminates workers,
+       reinitializes worker pool, and returns.
+    3. Update execution statuses in DB and set `error` outputs to `"TERMINATED"`.
+    """
+    queue_client = await execution_queue_client()
+    await queue_client.publish_message(
+        routing_key="",
+        message=execution_utils.CancelExecutionEvent(
+            graph_exec_id=graph_exec_id
+        ).model_dump_json(),
+        exchange=execution_utils.GRAPH_EXECUTION_CANCEL_EXCHANGE,
+    )
+
+    # Update the status of the graph execution
+    graph_execution = await execution_db.update_graph_execution_stats(
+        graph_exec_id,
+        execution_db.ExecutionStatus.TERMINATED,
+    )
+    if graph_execution:
+        await execution_event_bus().publish(graph_execution)
+
+    # Update the status of the node executions
+    node_execs = [
+        node_exec.model_copy(update={"status": execution_db.ExecutionStatus.TERMINATED})
+        for node_exec in await execution_db.get_node_executions(
+            graph_exec_id=graph_exec_id,
+            statuses=[
+                execution_db.ExecutionStatus.QUEUED,
+                execution_db.ExecutionStatus.RUNNING,
+                execution_db.ExecutionStatus.INCOMPLETE,
+            ],
+        )
+    ]
+    await execution_db.update_node_execution_status_batch(
+        [node_exec.node_exec_id for node_exec in node_execs],
+        execution_db.ExecutionStatus.TERMINATED,
+    )
+    await asyncio.gather(
+        *[execution_event_bus().publish(node_exec) for node_exec in node_execs]
+    )
 
 
 @v1_router.get(
@@ -593,8 +666,8 @@ async def stop_graph_run(
 )
 async def get_graphs_executions(
     user_id: Annotated[str, Depends(get_user_id)],
-) -> list[graph_db.GraphExecutionMeta]:
-    return await graph_db.get_graphs_executions(user_id=user_id)
+) -> list[execution_db.GraphExecutionMeta]:
+    return await execution_db.get_graph_executions(user_id=user_id)
 
 
 @v1_router.get(
@@ -605,8 +678,8 @@ async def get_graphs_executions(
 async def get_graph_executions(
     graph_id: str,
     user_id: Annotated[str, Depends(get_user_id)],
-) -> list[graph_db.GraphExecutionMeta]:
-    return await graph_db.get_graph_executions(graph_id=graph_id, user_id=user_id)
+) -> list[execution_db.GraphExecutionMeta]:
+    return await execution_db.get_graph_executions(graph_id=graph_id, user_id=user_id)
 
 
 @v1_router.get(
@@ -618,16 +691,39 @@ async def get_graph_execution(
     graph_id: str,
     graph_exec_id: str,
     user_id: Annotated[str, Depends(get_user_id)],
-) -> graph_db.GraphExecution:
-    graph = await graph_db.get_graph(graph_id, user_id=user_id)
+) -> execution_db.GraphExecution | execution_db.GraphExecutionWithNodes:
+    graph = await graph_db.get_graph(graph_id=graph_id, user_id=user_id)
     if not graph:
-        raise HTTPException(status_code=404, detail=f"Graph #{graph_id} not found.")
+        raise HTTPException(
+            status_code=HTTP_404_NOT_FOUND, detail=f"Graph #{graph_id} not found"
+        )
 
-    result = await graph_db.get_execution(execution_id=graph_exec_id, user_id=user_id)
-    if not result:
-        raise HTTPException(status_code=404, detail=f"Graph #{graph_id} not found.")
+    result = await execution_db.get_graph_execution(
+        user_id=user_id,
+        execution_id=graph_exec_id,
+        include_node_executions=graph.user_id == user_id,
+    )
+    if not result or result.graph_id != graph_id:
+        raise HTTPException(
+            status_code=404, detail=f"Graph execution #{graph_exec_id} not found."
+        )
 
     return result
+
+
+@v1_router.delete(
+    path="/executions/{graph_exec_id}",
+    tags=["graphs"],
+    dependencies=[Depends(auth_middleware)],
+    status_code=HTTP_204_NO_CONTENT,
+)
+async def delete_graph_execution(
+    graph_exec_id: str,
+    user_id: Annotated[str, Depends(get_user_id)],
+) -> None:
+    await execution_db.delete_graph_execution(
+        graph_exec_id=graph_exec_id, user_id=user_id
+    )
 
 
 ########################################################
@@ -650,7 +746,7 @@ class ScheduleCreationRequest(pydantic.BaseModel):
 async def create_schedule(
     user_id: Annotated[str, Depends(get_user_id)],
     schedule: ScheduleCreationRequest,
-) -> scheduler.JobInfo:
+) -> scheduler.GraphExecutionJobInfo:
     graph = await graph_db.get_graph(
         schedule.graph_id, schedule.graph_version, user_id=user_id
     )
@@ -660,14 +756,12 @@ async def create_schedule(
             detail=f"Graph #{schedule.graph_id} v.{schedule.graph_version} not found.",
         )
 
-    return await asyncio.to_thread(
-        lambda: execution_scheduler_client().add_execution_schedule(
-            graph_id=schedule.graph_id,
-            graph_version=graph.version,
-            cron=schedule.cron,
-            input_data=schedule.input_data,
-            user_id=user_id,
-        )
+    return await execution_scheduler_client().add_execution_schedule(
+        graph_id=schedule.graph_id,
+        graph_version=graph.version,
+        cron=schedule.cron,
+        input_data=schedule.input_data,
+        user_id=user_id,
     )
 
 
@@ -676,11 +770,11 @@ async def create_schedule(
     tags=["schedules"],
     dependencies=[Depends(auth_middleware)],
 )
-def delete_schedule(
+async def delete_schedule(
     schedule_id: str,
     user_id: Annotated[str, Depends(get_user_id)],
 ) -> dict[Any, Any]:
-    execution_scheduler_client().delete_schedule(schedule_id, user_id=user_id)
+    await execution_scheduler_client().delete_schedule(schedule_id, user_id=user_id)
     return {"id": schedule_id}
 
 
@@ -689,11 +783,11 @@ def delete_schedule(
     tags=["schedules"],
     dependencies=[Depends(auth_middleware)],
 )
-def get_execution_schedules(
+async def get_execution_schedules(
     user_id: Annotated[str, Depends(get_user_id)],
     graph_id: str | None = None,
-) -> list[scheduler.JobInfo]:
-    return execution_scheduler_client().get_execution_schedules(
+) -> list[scheduler.GraphExecutionJobInfo]:
+    return await execution_scheduler_client().get_execution_schedules(
         user_id=user_id,
         graph_id=graph_id,
     )
@@ -734,7 +828,7 @@ async def create_api_key(
     dependencies=[Depends(auth_middleware)],
 )
 async def get_api_keys(
-    user_id: Annotated[str, Depends(get_user_id)]
+    user_id: Annotated[str, Depends(get_user_id)],
 ) -> list[APIKeyWithoutHash]:
     """List all API keys for the user"""
     try:

@@ -4,32 +4,30 @@ from abc import ABC
 from enum import Enum, EnumMeta
 from json import JSONDecodeError
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, List, Literal, NamedTuple
-
-from pydantic import SecretStr
-
-from backend.integrations.providers import ProviderName
-
-if TYPE_CHECKING:
-    from enum import _EnumMemberT
+from typing import Any, Iterable, List, Literal, NamedTuple, Optional
 
 import anthropic
 import ollama
 import openai
+from anthropic.types import ToolParam
 from groq import Groq
+from pydantic import BaseModel, SecretStr
 
 from backend.data.block import Block, BlockCategory, BlockOutput, BlockSchema
 from backend.data.model import (
     APIKeyCredentials,
     CredentialsField,
     CredentialsMetaInput,
+    NodeExecutionStats,
     SchemaField,
 )
+from backend.integrations.providers import ProviderName
 from backend.util import json
+from backend.util.logging import TruncatedLogger
 from backend.util.settings import BehaveAs, Settings
 from backend.util.text import TextFormatter
 
-logger = logging.getLogger(__name__)
+logger = TruncatedLogger(logging.getLogger(__name__), "[LLM-Block]")
 fmt = TextFormatter()
 
 LLMProviderName = Literal[
@@ -38,6 +36,7 @@ LLMProviderName = Literal[
     ProviderName.OLLAMA,
     ProviderName.OPENAI,
     ProviderName.OPEN_ROUTER,
+    ProviderName.LLAMA_API,
 ]
 AICredentials = CredentialsMetaInput[LLMProviderName, Literal["api_key"]]
 
@@ -74,12 +73,10 @@ class ModelMetadata(NamedTuple):
 
 class LlmModelMeta(EnumMeta):
     @property
-    def __members__(
-        self: type["_EnumMemberT"],
-    ) -> MappingProxyType[str, "_EnumMemberT"]:
+    def __members__(self) -> MappingProxyType:
         if Settings().config.behave_as == BehaveAs.LOCAL:
             members = super().__members__
-            return members
+            return MappingProxyType(members)
         else:
             removed_providers = ["ollama"]
             existing_members = super().__members__
@@ -94,14 +91,19 @@ class LlmModelMeta(EnumMeta):
 class LlmModel(str, Enum, metaclass=LlmModelMeta):
     # OpenAI models
     O3_MINI = "o3-mini"
+    O3 = "o3-2025-04-16"
     O1 = "o1"
     O1_PREVIEW = "o1-preview"
     O1_MINI = "o1-mini"
+    GPT41 = "gpt-4.1-2025-04-14"
     GPT4O_MINI = "gpt-4o-mini"
     GPT4O = "gpt-4o"
     GPT4_TURBO = "gpt-4-turbo"
     GPT3_5_TURBO = "gpt-3.5-turbo"
     # Anthropic models
+    CLAUDE_4_OPUS = "claude-opus-4-20250514"
+    CLAUDE_4_SONNET = "claude-sonnet-4-20250514"
+    CLAUDE_3_7_SONNET = "claude-3-7-sonnet-20250219"
     CLAUDE_3_5_SONNET = "claude-3-5-sonnet-latest"
     CLAUDE_3_5_HAIKU = "claude-3-5-haiku-latest"
     CLAUDE_3_HAIKU = "claude-3-haiku-20240307"
@@ -122,6 +124,7 @@ class LlmModel(str, Enum, metaclass=LlmModelMeta):
     OLLAMA_DOLPHIN = "dolphin-mistral:latest"
     # OpenRouter models
     GEMINI_FLASH_1_5 = "google/gemini-flash-1.5"
+    GEMINI_2_5_PRO = "google/gemini-2.5-pro-preview-03-25"
     GROK_BETA = "x-ai/grok-beta"
     MISTRAL_NEMO = "mistralai/mistral-nemo"
     COHERE_COMMAND_R_08_2024 = "cohere/command-r-08-2024"
@@ -139,6 +142,13 @@ class LlmModel(str, Enum, metaclass=LlmModelMeta):
     AMAZON_NOVA_PRO_V1 = "amazon/nova-pro-v1"
     MICROSOFT_WIZARDLM_2_8X22B = "microsoft/wizardlm-2-8x22b"
     GRYPHE_MYTHOMAX_L2_13B = "gryphe/mythomax-l2-13b"
+    META_LLAMA_4_SCOUT = "meta-llama/llama-4-scout"
+    META_LLAMA_4_MAVERICK = "meta-llama/llama-4-maverick"
+    # Llama API models
+    LLAMA_API_LLAMA_4_SCOUT = "Llama-4-Scout-17B-16E-Instruct-FP8"
+    LLAMA_API_LLAMA4_MAVERICK = "Llama-4-Maverick-17B-128E-Instruct-FP8"
+    LLAMA_API_LLAMA3_3_8B = "Llama-3.3-8B-Instruct"
+    LLAMA_API_LLAMA3_3_70B = "Llama-3.3-70B-Instruct"
 
     @property
     def metadata(self) -> ModelMetadata:
@@ -159,12 +169,14 @@ class LlmModel(str, Enum, metaclass=LlmModelMeta):
 
 MODEL_METADATA = {
     # https://platform.openai.com/docs/models
+    LlmModel.O3: ModelMetadata("openai", 200000, 100000),
     LlmModel.O3_MINI: ModelMetadata("openai", 200000, 100000),  # o3-mini-2025-01-31
     LlmModel.O1: ModelMetadata("openai", 200000, 100000),  # o1-2024-12-17
     LlmModel.O1_PREVIEW: ModelMetadata(
         "openai", 128000, 32768
     ),  # o1-preview-2024-09-12
     LlmModel.O1_MINI: ModelMetadata("openai", 128000, 65536),  # o1-mini-2024-09-12
+    LlmModel.GPT41: ModelMetadata("openai", 1047576, 32768),
     LlmModel.GPT4O_MINI: ModelMetadata(
         "openai", 128000, 16384
     ),  # gpt-4o-mini-2024-07-18
@@ -174,6 +186,15 @@ MODEL_METADATA = {
     ),  # gpt-4-turbo-2024-04-09
     LlmModel.GPT3_5_TURBO: ModelMetadata("openai", 16385, 4096),  # gpt-3.5-turbo-0125
     # https://docs.anthropic.com/en/docs/about-claude/models
+    LlmModel.CLAUDE_4_OPUS: ModelMetadata(
+        "anthropic", 200000, 8192
+    ),  # claude-4-opus-20250514
+    LlmModel.CLAUDE_4_SONNET: ModelMetadata(
+        "anthropic", 200000, 8192
+    ),  # claude-4-sonnet-20250514
+    LlmModel.CLAUDE_3_7_SONNET: ModelMetadata(
+        "anthropic", 200000, 8192
+    ),  # claude-3-7-sonnet-20250219
     LlmModel.CLAUDE_3_5_SONNET: ModelMetadata(
         "anthropic", 200000, 8192
     ),  # claude-3-5-sonnet-20241022
@@ -199,6 +220,7 @@ MODEL_METADATA = {
     LlmModel.OLLAMA_DOLPHIN: ModelMetadata("ollama", 32768, None),
     # https://openrouter.ai/models
     LlmModel.GEMINI_FLASH_1_5: ModelMetadata("open_router", 1000000, 8192),
+    LlmModel.GEMINI_2_5_PRO: ModelMetadata("open_router", 1050000, 8192),
     LlmModel.GROK_BETA: ModelMetadata("open_router", 131072, 131072),
     LlmModel.MISTRAL_NEMO: ModelMetadata("open_router", 128000, 4096),
     LlmModel.COHERE_COMMAND_R_08_2024: ModelMetadata("open_router", 128000, 4096),
@@ -220,6 +242,13 @@ MODEL_METADATA = {
     LlmModel.AMAZON_NOVA_PRO_V1: ModelMetadata("open_router", 300000, 5120),
     LlmModel.MICROSOFT_WIZARDLM_2_8X22B: ModelMetadata("open_router", 65536, 4096),
     LlmModel.GRYPHE_MYTHOMAX_L2_13B: ModelMetadata("open_router", 4096, 4096),
+    LlmModel.META_LLAMA_4_SCOUT: ModelMetadata("open_router", 131072, 131072),
+    LlmModel.META_LLAMA_4_MAVERICK: ModelMetadata("open_router", 1048576, 1000000),
+    # Llama API models
+    LlmModel.LLAMA_API_LLAMA_4_SCOUT: ModelMetadata("llama_api", 128000, 4028),
+    LlmModel.LLAMA_API_LLAMA4_MAVERICK: ModelMetadata("llama_api", 128000, 4028),
+    LlmModel.LLAMA_API_LLAMA3_3_8B: ModelMetadata("llama_api", 128000, 4028),
+    LlmModel.LLAMA_API_LLAMA3_3_70B: ModelMetadata("llama_api", 128000, 4028),
 }
 
 for model in LlmModel:
@@ -227,21 +256,374 @@ for model in LlmModel:
         raise ValueError(f"Missing MODEL_METADATA metadata for model: {model}")
 
 
-class MessageRole(str, Enum):
-    SYSTEM = "system"
-    USER = "user"
-    ASSISTANT = "assistant"
+class ToolCall(BaseModel):
+    name: str
+    arguments: str
 
 
-class Message(BlockSchema):
-    role: MessageRole
-    content: str
+class ToolContentBlock(BaseModel):
+    id: str
+    type: str
+    function: ToolCall
+
+
+class LLMResponse(BaseModel):
+    raw_response: Any
+    prompt: List[Any]
+    response: str
+    tool_calls: Optional[List[ToolContentBlock]] | None
+    prompt_tokens: int
+    completion_tokens: int
+
+
+def convert_openai_tool_fmt_to_anthropic(
+    openai_tools: list[dict] | None = None,
+) -> Iterable[ToolParam] | anthropic.NotGiven:
+    """
+    Convert OpenAI tool format to Anthropic tool format.
+    """
+    if not openai_tools or len(openai_tools) == 0:
+        return anthropic.NOT_GIVEN
+
+    anthropic_tools = []
+    for tool in openai_tools:
+        if "function" in tool:
+            # Handle case where tool is already in OpenAI format with "type" and "function"
+            function_data = tool["function"]
+        else:
+            # Handle case where tool is just the function definition
+            function_data = tool
+
+        anthropic_tool: anthropic.types.ToolParam = {
+            "name": function_data["name"],
+            "description": function_data.get("description", ""),
+            "input_schema": {
+                "type": "object",
+                "properties": function_data.get("parameters", {}).get("properties", {}),
+                "required": function_data.get("parameters", {}).get("required", []),
+            },
+        }
+        anthropic_tools.append(anthropic_tool)
+
+    return anthropic_tools
+
+
+def estimate_token_count(prompt_messages: list[dict]) -> int:
+    char_count = sum(len(str(msg.get("content", ""))) for msg in prompt_messages)
+    message_overhead = len(prompt_messages) * 4
+    estimated_tokens = (char_count // 4) + message_overhead
+    return int(estimated_tokens * 1.2)
+
+
+def llm_call(
+    credentials: APIKeyCredentials,
+    llm_model: LlmModel,
+    prompt: list[dict],
+    json_format: bool,
+    max_tokens: int | None,
+    tools: list[dict] | None = None,
+    ollama_host: str = "localhost:11434",
+    parallel_tool_calls: bool | None = None,
+) -> LLMResponse:
+    """
+    Make a call to a language model.
+
+    Args:
+        credentials: The API key credentials to use.
+        llm_model: The LLM model to use.
+        prompt: The prompt to send to the LLM.
+        json_format: Whether the response should be in JSON format.
+        max_tokens: The maximum number of tokens to generate in the chat completion.
+        tools: The tools to use in the chat completion.
+        ollama_host: The host for ollama to use.
+
+    Returns:
+        LLMResponse object containing:
+            - prompt: The prompt sent to the LLM.
+            - response: The text response from the LLM.
+            - tool_calls: Any tool calls the model made, if applicable.
+            - prompt_tokens: The number of tokens used in the prompt.
+            - completion_tokens: The number of tokens used in the completion.
+    """
+    provider = llm_model.metadata.provider
+
+    # Calculate available tokens based on context window and input length
+    estimated_input_tokens = estimate_token_count(prompt)
+    context_window = llm_model.context_window
+    model_max_output = llm_model.max_output_tokens or 4096
+    user_max = max_tokens or model_max_output
+    available_tokens = max(context_window - estimated_input_tokens, 0)
+    max_tokens = max(min(available_tokens, model_max_output, user_max), 0)
+
+    if provider == "openai":
+        tools_param = tools if tools else openai.NOT_GIVEN
+        oai_client = openai.OpenAI(api_key=credentials.api_key.get_secret_value())
+        response_format = None
+
+        if llm_model in [LlmModel.O1_MINI, LlmModel.O1_PREVIEW]:
+            sys_messages = [p["content"] for p in prompt if p["role"] == "system"]
+            usr_messages = [p["content"] for p in prompt if p["role"] != "system"]
+            prompt = [
+                {"role": "user", "content": "\n".join(sys_messages)},
+                {"role": "user", "content": "\n".join(usr_messages)},
+            ]
+        elif json_format:
+            response_format = {"type": "json_object"}
+
+        response = oai_client.chat.completions.create(
+            model=llm_model.value,
+            messages=prompt,  # type: ignore
+            response_format=response_format,  # type: ignore
+            max_completion_tokens=max_tokens,
+            tools=tools_param,  # type: ignore
+            parallel_tool_calls=(
+                openai.NOT_GIVEN if parallel_tool_calls is None else parallel_tool_calls
+            ),
+        )
+
+        if response.choices[0].message.tool_calls:
+            tool_calls = [
+                ToolContentBlock(
+                    id=tool.id,
+                    type=tool.type,
+                    function=ToolCall(
+                        name=tool.function.name,
+                        arguments=tool.function.arguments,
+                    ),
+                )
+                for tool in response.choices[0].message.tool_calls
+            ]
+        else:
+            tool_calls = None
+
+        return LLMResponse(
+            raw_response=response.choices[0].message,
+            prompt=prompt,
+            response=response.choices[0].message.content or "",
+            tool_calls=tool_calls,
+            prompt_tokens=response.usage.prompt_tokens if response.usage else 0,
+            completion_tokens=response.usage.completion_tokens if response.usage else 0,
+        )
+    elif provider == "anthropic":
+
+        an_tools = convert_openai_tool_fmt_to_anthropic(tools)
+
+        system_messages = [p["content"] for p in prompt if p["role"] == "system"]
+        sysprompt = " ".join(system_messages)
+
+        messages = []
+        last_role = None
+        for p in prompt:
+            if p["role"] in ["user", "assistant"]:
+                if (
+                    p["role"] == last_role
+                    and isinstance(messages[-1]["content"], str)
+                    and isinstance(p["content"], str)
+                ):
+                    # If the role is the same as the last one, combine the content
+                    messages[-1]["content"] += p["content"]
+                else:
+                    messages.append({"role": p["role"], "content": p["content"]})
+                    last_role = p["role"]
+
+        client = anthropic.Anthropic(api_key=credentials.api_key.get_secret_value())
+        try:
+            resp = client.messages.create(
+                model=llm_model.value,
+                system=sysprompt,
+                messages=messages,
+                max_tokens=max_tokens,
+                tools=an_tools,
+            )
+
+            if not resp.content:
+                raise ValueError("No content returned from Anthropic.")
+
+            tool_calls = None
+            for content_block in resp.content:
+                # Antropic is different to openai, need to iterate through
+                # the content blocks to find the tool calls
+                if content_block.type == "tool_use":
+                    if tool_calls is None:
+                        tool_calls = []
+                    tool_calls.append(
+                        ToolContentBlock(
+                            id=content_block.id,
+                            type=content_block.type,
+                            function=ToolCall(
+                                name=content_block.name,
+                                arguments=json.dumps(content_block.input),
+                            ),
+                        )
+                    )
+
+            if not tool_calls and resp.stop_reason == "tool_use":
+                logger.warning(
+                    f"Tool use stop reason but no tool calls found in content. {resp}"
+                )
+
+            return LLMResponse(
+                raw_response=resp,
+                prompt=prompt,
+                response=(
+                    resp.content[0].name
+                    if isinstance(resp.content[0], anthropic.types.ToolUseBlock)
+                    else getattr(resp.content[0], "text", "")
+                ),
+                tool_calls=tool_calls,
+                prompt_tokens=resp.usage.input_tokens,
+                completion_tokens=resp.usage.output_tokens,
+            )
+        except anthropic.APIError as e:
+            error_message = f"Anthropic API error: {str(e)}"
+            logger.error(error_message)
+            raise ValueError(error_message)
+    elif provider == "groq":
+        if tools:
+            raise ValueError("Groq does not support tools.")
+
+        client = Groq(api_key=credentials.api_key.get_secret_value())
+        response_format = {"type": "json_object"} if json_format else None
+        response = client.chat.completions.create(
+            model=llm_model.value,
+            messages=prompt,  # type: ignore
+            response_format=response_format,  # type: ignore
+            max_tokens=max_tokens,
+        )
+        return LLMResponse(
+            raw_response=response.choices[0].message,
+            prompt=prompt,
+            response=response.choices[0].message.content or "",
+            tool_calls=None,
+            prompt_tokens=response.usage.prompt_tokens if response.usage else 0,
+            completion_tokens=response.usage.completion_tokens if response.usage else 0,
+        )
+    elif provider == "ollama":
+        if tools:
+            raise ValueError("Ollama does not support tools.")
+
+        client = ollama.Client(host=ollama_host)
+        sys_messages = [p["content"] for p in prompt if p["role"] == "system"]
+        usr_messages = [p["content"] for p in prompt if p["role"] != "system"]
+        response = client.generate(
+            model=llm_model.value,
+            prompt=f"{sys_messages}\n\n{usr_messages}",
+            stream=False,
+            options={"num_ctx": max_tokens},
+        )
+        return LLMResponse(
+            raw_response=response.get("response") or "",
+            prompt=prompt,
+            response=response.get("response") or "",
+            tool_calls=None,
+            prompt_tokens=response.get("prompt_eval_count") or 0,
+            completion_tokens=response.get("eval_count") or 0,
+        )
+    elif provider == "open_router":
+        tools_param = tools if tools else openai.NOT_GIVEN
+        client = openai.OpenAI(
+            base_url="https://openrouter.ai/api/v1",
+            api_key=credentials.api_key.get_secret_value(),
+        )
+
+        response = client.chat.completions.create(
+            extra_headers={
+                "HTTP-Referer": "https://agpt.co",
+                "X-Title": "AutoGPT",
+            },
+            model=llm_model.value,
+            messages=prompt,  # type: ignore
+            max_tokens=max_tokens,
+            tools=tools_param,  # type: ignore
+        )
+
+        # If there's no response, raise an error
+        if not response.choices:
+            if response:
+                raise ValueError(f"OpenRouter error: {response}")
+            else:
+                raise ValueError("No response from OpenRouter.")
+
+        if response.choices[0].message.tool_calls:
+            tool_calls = [
+                ToolContentBlock(
+                    id=tool.id,
+                    type=tool.type,
+                    function=ToolCall(
+                        name=tool.function.name, arguments=tool.function.arguments
+                    ),
+                )
+                for tool in response.choices[0].message.tool_calls
+            ]
+        else:
+            tool_calls = None
+
+        return LLMResponse(
+            raw_response=response.choices[0].message,
+            prompt=prompt,
+            response=response.choices[0].message.content or "",
+            tool_calls=tool_calls,
+            prompt_tokens=response.usage.prompt_tokens if response.usage else 0,
+            completion_tokens=response.usage.completion_tokens if response.usage else 0,
+        )
+    elif provider == "llama_api":
+        tools_param = tools if tools else openai.NOT_GIVEN
+        client = openai.OpenAI(
+            base_url="https://api.llama.com/compat/v1/",
+            api_key=credentials.api_key.get_secret_value(),
+        )
+
+        response = client.chat.completions.create(
+            extra_headers={
+                "HTTP-Referer": "https://agpt.co",
+                "X-Title": "AutoGPT",
+            },
+            model=llm_model.value,
+            messages=prompt,  # type: ignore
+            max_tokens=max_tokens,
+            tools=tools_param,  # type: ignore
+            parallel_tool_calls=(
+                openai.NOT_GIVEN if parallel_tool_calls is None else parallel_tool_calls
+            ),
+        )
+
+        # If there's no response, raise an error
+        if not response.choices:
+            if response:
+                raise ValueError(f"Llama API error: {response}")
+            else:
+                raise ValueError("No response from Llama API.")
+
+        if response.choices[0].message.tool_calls:
+            tool_calls = [
+                ToolContentBlock(
+                    id=tool.id,
+                    type=tool.type,
+                    function=ToolCall(
+                        name=tool.function.name, arguments=tool.function.arguments
+                    ),
+                )
+                for tool in response.choices[0].message.tool_calls
+            ]
+        else:
+            tool_calls = None
+
+        return LLMResponse(
+            raw_response=response.choices[0].message,
+            prompt=prompt,
+            response=response.choices[0].message.content or "",
+            tool_calls=tool_calls,
+            prompt_tokens=response.usage.prompt_tokens if response.usage else 0,
+            completion_tokens=response.usage.completion_tokens if response.usage else 0,
+        )
+    else:
+        raise ValueError(f"Unsupported LLM provider: {provider}")
 
 
 class AIBlockBase(Block, ABC):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.prompt = ""
+        self.prompt = []
 
     def merge_llm_stats(self, block: "AIBlockBase"):
         self.merge_stats(block.execution_stats)
@@ -260,7 +642,7 @@ class AIStructuredResponseGeneratorBlock(AIBlockBase):
         )
         model: LlmModel = SchemaField(
             title="LLM Model",
-            default=LlmModel.GPT4_TURBO,
+            default=LlmModel.GPT4O,
             description="The language model to use for answering the prompt.",
             advanced=False,
         )
@@ -270,8 +652,8 @@ class AIStructuredResponseGeneratorBlock(AIBlockBase):
             default="",
             description="The system prompt to provide additional context to the model.",
         )
-        conversation_history: list[Message] = SchemaField(
-            default=[],
+        conversation_history: list[dict] = SchemaField(
+            default_factory=list,
             description="The conversation history to provide context for the prompt.",
         )
         retry: int = SchemaField(
@@ -281,7 +663,7 @@ class AIStructuredResponseGeneratorBlock(AIBlockBase):
         )
         prompt_values: dict[str, str] = SchemaField(
             advanced=False,
-            default={},
+            default_factory=dict,
             description="Values used to fill in the prompt. The values can be used in the prompt by putting them in a double curly braces, e.g. {{variable_name}}.",
         )
         max_tokens: int | None = SchemaField(
@@ -300,7 +682,7 @@ class AIStructuredResponseGeneratorBlock(AIBlockBase):
         response: dict[str, Any] = SchemaField(
             description="The response object generated by the language model."
         )
-        prompt: str = SchemaField(description="The prompt sent to the language model.")
+        prompt: list = SchemaField(description="The prompt sent to the language model.")
         error: str = SchemaField(description="Error message if the API call failed.")
 
     def __init__(self):
@@ -311,7 +693,7 @@ class AIStructuredResponseGeneratorBlock(AIBlockBase):
             input_schema=AIStructuredResponseGeneratorBlock.Input,
             output_schema=AIStructuredResponseGeneratorBlock.Output,
             test_input={
-                "model": LlmModel.GPT4_TURBO,
+                "model": LlmModel.GPT4O,
                 "credentials": TEST_CREDENTIALS_INPUT,
                 "expected_format": {
                     "key1": "value1",
@@ -322,22 +704,24 @@ class AIStructuredResponseGeneratorBlock(AIBlockBase):
             test_credentials=TEST_CREDENTIALS,
             test_output=[
                 ("response", {"key1": "key1Value", "key2": "key2Value"}),
-                ("prompt", str),
+                ("prompt", list),
             ],
             test_mock={
-                "llm_call": lambda *args, **kwargs: (
-                    json.dumps(
+                "llm_call": lambda *args, **kwargs: LLMResponse(
+                    raw_response="",
+                    prompt=[""],
+                    response=json.dumps(
                         {
                             "key1": "key1Value",
                             "key2": "key2Value",
                         }
                     ),
-                    0,
-                    0,
+                    tool_calls=None,
+                    prompt_tokens=0,
+                    completion_tokens=0,
                 )
             },
         )
-        self.prompt = ""
 
     def llm_call(
         self,
@@ -346,160 +730,29 @@ class AIStructuredResponseGeneratorBlock(AIBlockBase):
         prompt: list[dict],
         json_format: bool,
         max_tokens: int | None,
+        tools: list[dict] | None = None,
         ollama_host: str = "localhost:11434",
-    ) -> tuple[str, int, int]:
+    ) -> LLMResponse:
         """
-        Args:
-            credentials: The API key credentials to use.
-            llm_model: The LLM model to use.
-            prompt: The prompt to send to the LLM.
-            json_format: Whether the response should be in JSON format.
-            max_tokens: The maximum number of tokens to generate in the chat completion.
-            ollama_host: The host for ollama to use
-
-        Returns:
-            The response from the LLM.
-            The number of tokens used in the prompt.
-            The number of tokens used in the completion.
+        Test mocks work only on class functions, this wraps the llm_call function
+        so that it can be mocked withing the block testing framework.
         """
-        provider = llm_model.metadata.provider
-        max_tokens = max_tokens or llm_model.max_output_tokens or 4096
-
-        if provider == "openai":
-            oai_client = openai.OpenAI(api_key=credentials.api_key.get_secret_value())
-            response_format = None
-
-            if llm_model in [LlmModel.O1_MINI, LlmModel.O1_PREVIEW]:
-                sys_messages = [p["content"] for p in prompt if p["role"] == "system"]
-                usr_messages = [p["content"] for p in prompt if p["role"] != "system"]
-                prompt = [
-                    {"role": "user", "content": "\n".join(sys_messages)},
-                    {"role": "user", "content": "\n".join(usr_messages)},
-                ]
-            elif json_format:
-                response_format = {"type": "json_object"}
-
-            response = oai_client.chat.completions.create(
-                model=llm_model.value,
-                messages=prompt,  # type: ignore
-                response_format=response_format,  # type: ignore
-                max_completion_tokens=max_tokens,
-            )
-            self.prompt = json.dumps(prompt)
-
-            return (
-                response.choices[0].message.content or "",
-                response.usage.prompt_tokens if response.usage else 0,
-                response.usage.completion_tokens if response.usage else 0,
-            )
-        elif provider == "anthropic":
-            system_messages = [p["content"] for p in prompt if p["role"] == "system"]
-            sysprompt = " ".join(system_messages)
-
-            messages = []
-            last_role = None
-            for p in prompt:
-                if p["role"] in ["user", "assistant"]:
-                    if p["role"] != last_role:
-                        messages.append({"role": p["role"], "content": p["content"]})
-                        last_role = p["role"]
-                    else:
-                        # If the role is the same as the last one, combine the content
-                        messages[-1]["content"] += "\n" + p["content"]
-
-            client = anthropic.Anthropic(api_key=credentials.api_key.get_secret_value())
-            try:
-                resp = client.messages.create(
-                    model=llm_model.value,
-                    system=sysprompt,
-                    messages=messages,
-                    max_tokens=max_tokens,
-                )
-                self.prompt = json.dumps(prompt)
-
-                if not resp.content:
-                    raise ValueError("No content returned from Anthropic.")
-
-                return (
-                    (
-                        resp.content[0].name
-                        if isinstance(resp.content[0], anthropic.types.ToolUseBlock)
-                        else resp.content[0].text
-                    ),
-                    resp.usage.input_tokens,
-                    resp.usage.output_tokens,
-                )
-            except anthropic.APIError as e:
-                error_message = f"Anthropic API error: {str(e)}"
-                logger.error(error_message)
-                raise ValueError(error_message)
-        elif provider == "groq":
-            client = Groq(api_key=credentials.api_key.get_secret_value())
-            response_format = {"type": "json_object"} if json_format else None
-            response = client.chat.completions.create(
-                model=llm_model.value,
-                messages=prompt,  # type: ignore
-                response_format=response_format,  # type: ignore
-                max_tokens=max_tokens,
-            )
-            self.prompt = json.dumps(prompt)
-            return (
-                response.choices[0].message.content or "",
-                response.usage.prompt_tokens if response.usage else 0,
-                response.usage.completion_tokens if response.usage else 0,
-            )
-        elif provider == "ollama":
-            client = ollama.Client(host=ollama_host)
-            sys_messages = [p["content"] for p in prompt if p["role"] == "system"]
-            usr_messages = [p["content"] for p in prompt if p["role"] != "system"]
-            response = client.generate(
-                model=llm_model.value,
-                prompt=f"{sys_messages}\n\n{usr_messages}",
-                stream=False,
-            )
-            self.prompt = json.dumps(prompt)
-            return (
-                response.get("response") or "",
-                response.get("prompt_eval_count") or 0,
-                response.get("eval_count") or 0,
-            )
-        elif provider == "open_router":
-            client = openai.OpenAI(
-                base_url="https://openrouter.ai/api/v1",
-                api_key=credentials.api_key.get_secret_value(),
-            )
-
-            response = client.chat.completions.create(
-                extra_headers={
-                    "HTTP-Referer": "https://agpt.co",
-                    "X-Title": "AutoGPT",
-                },
-                model=llm_model.value,
-                messages=prompt,  # type: ignore
-                max_tokens=max_tokens,
-            )
-            self.prompt = json.dumps(prompt)
-
-            # If there's no response, raise an error
-            if not response.choices:
-                if response:
-                    raise ValueError(f"OpenRouter error: {response}")
-                else:
-                    raise ValueError("No response from OpenRouter.")
-
-            return (
-                response.choices[0].message.content or "",
-                response.usage.prompt_tokens if response.usage else 0,
-                response.usage.completion_tokens if response.usage else 0,
-            )
-        else:
-            raise ValueError(f"Unsupported LLM provider: {provider}")
+        self.prompt = prompt
+        return llm_call(
+            credentials=credentials,
+            llm_model=llm_model,
+            prompt=prompt,
+            json_format=json_format,
+            max_tokens=max_tokens,
+            tools=tools,
+            ollama_host=ollama_host,
+        )
 
     def run(
         self, input_data: Input, *, credentials: APIKeyCredentials, **kwargs
     ) -> BlockOutput:
         logger.debug(f"Calling LLM with input data: {input_data}")
-        prompt = [p.model_dump() for p in input_data.conversation_history]
+        prompt = [json.to_dict(p) for p in input_data.conversation_history]
 
         def trim_prompt(s: str) -> str:
             lines = s.strip().split("\n")
@@ -549,7 +802,7 @@ class AIStructuredResponseGeneratorBlock(AIBlockBase):
 
         for retry_count in range(input_data.retry):
             try:
-                response_text, input_token, output_token = self.llm_call(
+                llm_response = self.llm_call(
                     credentials=credentials,
                     llm_model=llm_model,
                     prompt=prompt,
@@ -557,11 +810,12 @@ class AIStructuredResponseGeneratorBlock(AIBlockBase):
                     ollama_host=input_data.ollama_host,
                     max_tokens=input_data.max_tokens,
                 )
+                response_text = llm_response.response
                 self.merge_stats(
-                    {
-                        "input_token_count": input_token,
-                        "output_token_count": output_token,
-                    }
+                    NodeExecutionStats(
+                        input_token_count=llm_response.prompt_tokens,
+                        output_token_count=llm_response.completion_tokens,
+                    )
                 )
                 logger.info(f"LLM attempt-{retry_count} response: {response_text}")
 
@@ -601,13 +855,23 @@ class AIStructuredResponseGeneratorBlock(AIBlockBase):
                 prompt.append({"role": "user", "content": retry_prompt})
             except Exception as e:
                 logger.exception(f"Error calling LLM: {e}")
+                if (
+                    "maximum context length" in str(e).lower()
+                    or "token limit" in str(e).lower()
+                ):
+                    if input_data.max_tokens is None:
+                        input_data.max_tokens = llm_model.max_output_tokens or 4096
+                    input_data.max_tokens = int(input_data.max_tokens * 0.85)
+                    logger.debug(
+                        f"Reducing max_tokens to {input_data.max_tokens} for next attempt"
+                    )
                 retry_prompt = f"Error calling LLM: {e}"
             finally:
                 self.merge_stats(
-                    {
-                        "llm_call_count": retry_count + 1,
-                        "llm_retry_count": retry_count,
-                    }
+                    NodeExecutionStats(
+                        llm_call_count=retry_count + 1,
+                        llm_retry_count=retry_count,
+                    )
                 )
 
         raise RuntimeError(retry_prompt)
@@ -621,7 +885,7 @@ class AITextGeneratorBlock(AIBlockBase):
         )
         model: LlmModel = SchemaField(
             title="LLM Model",
-            default=LlmModel.GPT4_TURBO,
+            default=LlmModel.GPT4O,
             description="The language model to use for answering the prompt.",
             advanced=False,
         )
@@ -638,7 +902,7 @@ class AITextGeneratorBlock(AIBlockBase):
         )
         prompt_values: dict[str, str] = SchemaField(
             advanced=False,
-            default={},
+            default_factory=dict,
             description="Values used to fill in the prompt. The values can be used in the prompt by putting them in a double curly braces, e.g. {{variable_name}}.",
         )
         ollama_host: str = SchemaField(
@@ -656,7 +920,7 @@ class AITextGeneratorBlock(AIBlockBase):
         response: str = SchemaField(
             description="The response generated by the language model."
         )
-        prompt: str = SchemaField(description="The prompt sent to the language model.")
+        prompt: list = SchemaField(description="The prompt sent to the language model.")
         error: str = SchemaField(description="Error message if the API call failed.")
 
     def __init__(self):
@@ -673,7 +937,7 @@ class AITextGeneratorBlock(AIBlockBase):
             test_credentials=TEST_CREDENTIALS,
             test_output=[
                 ("response", "Response text"),
-                ("prompt", str),
+                ("prompt", list),
             ],
             test_mock={"llm_call": lambda *args, **kwargs: "Response text"},
         )
@@ -692,7 +956,10 @@ class AITextGeneratorBlock(AIBlockBase):
         self, input_data: Input, *, credentials: APIKeyCredentials, **kwargs
     ) -> BlockOutput:
         object_input_data = AIStructuredResponseGeneratorBlock.Input(
-            **{attr: getattr(input_data, attr) for attr in input_data.model_fields},
+            **{
+                attr: getattr(input_data, attr)
+                for attr in AITextGeneratorBlock.Input.model_fields
+            },
             expected_format={},
         )
         yield "response", self.llm_call(object_input_data, credentials)
@@ -714,7 +981,7 @@ class AITextSummarizerBlock(AIBlockBase):
         )
         model: LlmModel = SchemaField(
             title="LLM Model",
-            default=LlmModel.GPT4_TURBO,
+            default=LlmModel.GPT4O,
             description="The language model to use for summarizing the text.",
         )
         focus: str = SchemaField(
@@ -749,7 +1016,7 @@ class AITextSummarizerBlock(AIBlockBase):
 
     class Output(BlockSchema):
         summary: str = SchemaField(description="The final summary of the text.")
-        prompt: str = SchemaField(description="The prompt sent to the language model.")
+        prompt: list = SchemaField(description="The prompt sent to the language model.")
         error: str = SchemaField(description="Error message if the API call failed.")
 
     def __init__(self):
@@ -766,7 +1033,7 @@ class AITextSummarizerBlock(AIBlockBase):
             test_credentials=TEST_CREDENTIALS,
             test_output=[
                 ("summary", "Final summary of a long text"),
-                ("prompt", str),
+                ("prompt", list),
             ],
             test_mock={
                 "llm_call": lambda input_data, credentials: (
@@ -875,12 +1142,18 @@ class AITextSummarizerBlock(AIBlockBase):
 
 class AIConversationBlock(AIBlockBase):
     class Input(BlockSchema):
-        messages: List[Message] = SchemaField(
-            description="List of messages in the conversation.", min_length=1
+        prompt: str = SchemaField(
+            description="The prompt to send to the language model.",
+            placeholder="Enter your prompt here...",
+            default="",
+            advanced=False,
+        )
+        messages: List[Any] = SchemaField(
+            description="List of messages in the conversation.",
         )
         model: LlmModel = SchemaField(
             title="LLM Model",
-            default=LlmModel.GPT4_TURBO,
+            default=LlmModel.GPT4O,
             description="The language model to use for the conversation.",
         )
         credentials: AICredentials = AICredentialsField()
@@ -899,7 +1172,7 @@ class AIConversationBlock(AIBlockBase):
         response: str = SchemaField(
             description="The model's response to the conversation."
         )
-        prompt: str = SchemaField(description="The prompt sent to the language model.")
+        prompt: list = SchemaField(description="The prompt sent to the language model.")
         error: str = SchemaField(description="Error message if the API call failed.")
 
     def __init__(self):
@@ -919,7 +1192,7 @@ class AIConversationBlock(AIBlockBase):
                     },
                     {"role": "user", "content": "Where was it played?"},
                 ],
-                "model": LlmModel.GPT4_TURBO,
+                "model": LlmModel.GPT4O,
                 "credentials": TEST_CREDENTIALS_INPUT,
             },
             test_credentials=TEST_CREDENTIALS,
@@ -928,7 +1201,7 @@ class AIConversationBlock(AIBlockBase):
                     "response",
                     "The 2020 World Series was played at Globe Life Field in Arlington, Texas.",
                 ),
-                ("prompt", str),
+                ("prompt", list),
             ],
             test_mock={
                 "llm_call": lambda *args, **kwargs: "The 2020 World Series was played at Globe Life Field in Arlington, Texas."
@@ -950,7 +1223,7 @@ class AIConversationBlock(AIBlockBase):
     ) -> BlockOutput:
         response = self.llm_call(
             AIStructuredResponseGeneratorBlock.Input(
-                prompt="",
+                prompt=input_data.prompt,
                 credentials=input_data.credentials,
                 model=input_data.model,
                 conversation_history=input_data.messages,
@@ -981,7 +1254,7 @@ class AIListGeneratorBlock(AIBlockBase):
         )
         model: LlmModel = SchemaField(
             title="LLM Model",
-            default=LlmModel.GPT4_TURBO,
+            default=LlmModel.GPT4O,
             description="The language model to use for generating the list.",
             advanced=True,
         )
@@ -1008,7 +1281,7 @@ class AIListGeneratorBlock(AIBlockBase):
         list_item: str = SchemaField(
             description="Each individual item in the list.",
         )
-        prompt: str = SchemaField(description="The prompt sent to the language model.")
+        prompt: list = SchemaField(description="The prompt sent to the language model.")
         error: str = SchemaField(
             description="Error message if the list generation failed."
         )
@@ -1030,7 +1303,7 @@ class AIListGeneratorBlock(AIBlockBase):
                     "drawing explorers to uncover its mysteries. Each planet showcases the limitless possibilities of "
                     "fictional worlds."
                 ),
-                "model": LlmModel.GPT4_TURBO,
+                "model": LlmModel.GPT4O,
                 "credentials": TEST_CREDENTIALS_INPUT,
                 "max_retries": 3,
             },
@@ -1040,7 +1313,7 @@ class AIListGeneratorBlock(AIBlockBase):
                     "generated_list",
                     ["Zylora Prime", "Kharon-9", "Vortexia", "Oceara", "Draknos"],
                 ),
-                ("prompt", str),
+                ("prompt", list),
                 ("list_item", "Zylora Prime"),
                 ("list_item", "Kharon-9"),
                 ("list_item", "Vortexia"),

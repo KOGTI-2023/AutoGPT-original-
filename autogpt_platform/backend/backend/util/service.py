@@ -1,128 +1,63 @@
 import asyncio
-import builtins
+import inspect
 import logging
 import os
 import threading
 import time
-import typing
 from abc import ABC, abstractmethod
-from enum import Enum
-from types import NoneType, UnionType
+from functools import cached_property, update_wrapper
 from typing import (
-    Annotated,
     Any,
     Awaitable,
     Callable,
+    Concatenate,
     Coroutine,
-    Dict,
-    FrozenSet,
-    Iterator,
-    List,
     Optional,
-    Set,
+    ParamSpec,
     Tuple,
     Type,
     TypeVar,
-    Union,
     cast,
-    get_args,
-    get_origin,
 )
 
-import Pyro5.api
-from pydantic import BaseModel
-from Pyro5 import api as pyro
-from Pyro5 import config as pyro_config
+import httpx
+import uvicorn
+from fastapi import FastAPI, Request, responses
+from pydantic import BaseModel, TypeAdapter, create_model
 
-from backend.data import db, rabbitmq, redis
-from backend.util.process import AppProcess
+from backend.util.exceptions import InsufficientBalanceError
+from backend.util.json import to_dict
+from backend.util.metrics import sentry_init
+from backend.util.process import AppProcess, get_service_name
 from backend.util.retry import conn_retry
-from backend.util.settings import Config, Secrets
+from backend.util.settings import Config
 
 logger = logging.getLogger(__name__)
 T = TypeVar("T")
 C = TypeVar("C", bound=Callable)
 
 config = Config()
-pyro_host = config.pyro_host
-pyro_config.MAX_RETRIES = config.pyro_client_comm_retry  # type: ignore
-pyro_config.COMMTIMEOUT = config.pyro_client_comm_timeout  # type: ignore
+api_host = config.pyro_host
+api_comm_retry = config.pyro_client_comm_retry
+api_comm_timeout = config.pyro_client_comm_timeout
+api_call_timeout = config.rpc_client_call_timeout
+
+P = ParamSpec("P")
+R = TypeVar("R")
+EXPOSED_FLAG = "__exposed__"
 
 
 def expose(func: C) -> C:
-    """
-    Decorator to mark a method or class to be exposed for remote calls.
-
-    ## ⚠️ Gotcha
-    Aside from "simple" types, only Pydantic models are passed unscathed *if annotated*.
-    Any other passed or returned class objects are converted to dictionaries by Pyro.
-    """
-
-    def wrapper(*args, **kwargs):
-        try:
-            return func(*args, **kwargs)
-        except Exception as e:
-            msg = f"Error in {func.__name__}: {e}"
-            if isinstance(e, ValueError):
-                logger.warning(msg)
-            else:
-                logger.exception(msg)
-            raise
-
-    register_pydantic_serializers(func)
-
-    return pyro.expose(wrapper)  # type: ignore
+    func = getattr(func, "__func__", func)
+    setattr(func, EXPOSED_FLAG, True)
+    return func
 
 
-def register_pydantic_serializers(func: Callable):
-    """Register custom serializers and deserializers for annotated Pydantic models"""
-    for name, annotation in func.__annotations__.items():
-        try:
-            pydantic_types = _pydantic_models_from_type_annotation(annotation)
-        except Exception as e:
-            raise TypeError(f"Error while exposing {func.__name__}: {e}")
-
-        for model in pydantic_types:
-            logger.debug(
-                f"Registering Pyro (de)serializers for {func.__name__} annotation "
-                f"'{name}': {model.__qualname__}"
-            )
-            pyro.register_class_to_dict(model, _make_custom_serializer(model))
-            pyro.register_dict_to_class(
-                model.__qualname__, _make_custom_deserializer(model)
-            )
-
-
-def _make_custom_serializer(model: Type[BaseModel]):
-    def custom_class_to_dict(obj):
-        data = {
-            "__class__": obj.__class__.__qualname__,
-            **obj.model_dump(),
-        }
-        logger.debug(f"Serializing {obj.__class__.__qualname__} with data: {data}")
-        return data
-
-    return custom_class_to_dict
-
-
-def _make_custom_deserializer(model: Type[BaseModel]):
-    def custom_dict_to_class(qualname, data: dict):
-        logger.debug(f"Deserializing {model.__qualname__} from data: {data}")
-        return model(**data)
-
-    return custom_dict_to_class
-
-
-class AppService(AppProcess, ABC):
+# --------------------------------------------------
+# AppService for IPC service based on HTTP request through FastAPI
+# --------------------------------------------------
+class BaseAppService(AppProcess, ABC):
     shared_event_loop: asyncio.AbstractEventLoop
-    use_db: bool = False
-    use_redis: bool = False
-    rabbitmq_config: Optional[rabbitmq.RabbitMQConfig] = None
-    rabbitmq_service: Optional[rabbitmq.AsyncRabbitMQ] = None
-    use_supabase: bool = False
-
-    def __init__(self):
-        self.uri = None
 
     @classmethod
     @abstractmethod
@@ -131,176 +66,321 @@ class AppService(AppProcess, ABC):
 
     @classmethod
     def get_host(cls) -> str:
-        return os.environ.get(f"{cls.service_name.upper()}_HOST", config.pyro_host)
+        source_host = os.environ.get(f"{get_service_name().upper()}_HOST", api_host)
+        target_host = os.environ.get(f"{cls.service_name.upper()}_HOST", api_host)
 
-    @property
-    def rabbit(self) -> rabbitmq.AsyncRabbitMQ:
-        """Access the RabbitMQ service. Will raise if not configured."""
-        if not self.rabbitmq_service:
-            raise RuntimeError("RabbitMQ not configured for this service")
-        return self.rabbitmq_service
+        if source_host == target_host and source_host != api_host:
+            logger.warning(
+                f"Service {cls.service_name} is the same host as the source service."
+                f"Use the localhost of {api_host} instead."
+            )
+            return api_host
 
-    @property
-    def rabbit_config(self) -> rabbitmq.RabbitMQConfig:
-        """Access the RabbitMQ config. Will raise if not configured."""
-        if not self.rabbitmq_config:
-            raise RuntimeError("RabbitMQ not configured for this service")
-        return self.rabbitmq_config
+        return target_host
 
     def run_service(self) -> None:
         while True:
             time.sleep(10)
 
-    def __run_async(self, coro: Coroutine[Any, Any, T]):
-        return asyncio.run_coroutine_threadsafe(coro, self.shared_event_loop)
-
     def run_and_wait(self, coro: Coroutine[Any, Any, T]) -> T:
-        future = self.__run_async(coro)
-        return future.result()
+        return asyncio.run_coroutine_threadsafe(coro, self.shared_event_loop).result()
 
     def run(self):
         self.shared_event_loop = asyncio.get_event_loop()
-        if self.use_db:
-            self.shared_event_loop.run_until_complete(db.connect())
-        if self.use_redis:
-            redis.connect()
-        if self.rabbitmq_config:
-            logger.info(f"[{self.__class__.__name__}] ⏳ Configuring RabbitMQ...")
-            # if self.use_async:
-            self.rabbitmq_service = rabbitmq.AsyncRabbitMQ(self.rabbitmq_config)
-            self.shared_event_loop.run_until_complete(self.rabbitmq_service.connect())
-            # else:
-            #     self.rabbitmq_service = rabbitmq.SyncRabbitMQ(self.rabbitmq_config)
-            #     self.rabbitmq_service.connect()
-        if self.use_supabase:
-            from supabase import create_client
 
-            secrets = Secrets()
-            self.supabase = create_client(
-                secrets.supabase_url, secrets.supabase_service_role_key
+
+class RemoteCallError(BaseModel):
+    type: str = "RemoteCallError"
+    args: Optional[Tuple[Any, ...]] = None
+
+
+EXCEPTION_MAPPING = {
+    e.__name__: e
+    for e in [
+        ValueError,
+        TimeoutError,
+        ConnectionError,
+        InsufficientBalanceError,
+    ]
+}
+
+
+class AppService(BaseAppService, ABC):
+    fastapi_app: FastAPI
+
+    @staticmethod
+    def _handle_internal_http_error(status_code: int = 500, log_error: bool = True):
+        def handler(request: Request, exc: Exception):
+            if log_error:
+                if status_code == 500:
+                    log = logger.exception
+                else:
+                    log = logger.error
+                log(f"{request.method} {request.url.path} failed: {exc}")
+            return responses.JSONResponse(
+                status_code=status_code,
+                content=RemoteCallError(
+                    type=str(exc.__class__.__name__),
+                    args=exc.args or (str(exc),),
+                ).model_dump(),
             )
 
-        # Initialize the async loop.
-        async_thread = threading.Thread(target=self.__start_async_loop)
-        async_thread.daemon = True
-        async_thread.start()
+        return handler
 
-        # Initialize pyro service
-        daemon_thread = threading.Thread(target=self.__start_pyro)
-        daemon_thread.daemon = True
-        daemon_thread.start()
+    def _create_fastapi_endpoint(self, func: Callable) -> Callable:
+        """
+        Generates a FastAPI endpoint for the given function, handling default and optional parameters.
 
-        # Run the main service (if it's not implemented, just sleep).
-        self.run_service()
+        :param func: The original function (sync/async, bound or unbound)
+        :return: A FastAPI endpoint function.
+        """
+        sig = inspect.signature(func)
+        fields = {}
 
-    def cleanup(self):
-        if self.use_db:
-            logger.info(f"[{self.__class__.__name__}] ⏳ Disconnecting DB...")
-            self.run_and_wait(db.disconnect())
-        if self.use_redis:
-            logger.info(f"[{self.__class__.__name__}] ⏳ Disconnecting Redis...")
-            redis.disconnect()
-        if self.rabbitmq_config:
-            logger.info(f"[{self.__class__.__name__}] ⏳ Disconnecting RabbitMQ...")
+        is_bound_method = False
+        for name, param in sig.parameters.items():
+            if name in ("self", "cls"):
+                is_bound_method = True
+                continue
 
-    @conn_retry("Pyro", "Starting Pyro Service")
-    def __start_pyro(self):
-        maximum_connection_thread_count = max(
-            Pyro5.config.THREADPOOL_SIZE,
-            config.num_node_workers * config.num_graph_workers,
+            # Use the provided annotation or fallback to str if not specified
+            annotation = (
+                param.annotation if param.annotation != inspect.Parameter.empty else str
+            )
+
+            # If a default value is provided, use it; otherwise, mark the field as required with '...'
+            default = param.default if param.default != inspect.Parameter.empty else ...
+
+            fields[name] = (annotation, default)
+
+        # Dynamically create a Pydantic model for the request body
+        RequestBodyModel = create_model("RequestBodyModel", **fields)
+        f = func.__get__(self) if is_bound_method else func
+
+        if asyncio.iscoroutinefunction(f):
+
+            async def async_endpoint(body: RequestBodyModel):  # type: ignore #RequestBodyModel being variable
+                return await f(
+                    **{name: getattr(body, name) for name in type(body).model_fields}
+                )
+
+            return async_endpoint
+        else:
+
+            def sync_endpoint(body: RequestBodyModel):  # type: ignore #RequestBodyModel being variable
+                return f(
+                    **{name: getattr(body, name) for name in type(body).model_fields}
+                )
+
+            return sync_endpoint
+
+    @conn_retry("FastAPI server", "Starting FastAPI server")
+    def __start_fastapi(self):
+        logger.info(
+            f"[{self.service_name}] Starting RPC server at http://{api_host}:{self.get_port()}"
+        )
+        server = uvicorn.Server(
+            uvicorn.Config(
+                self.fastapi_app,
+                host=api_host,
+                port=self.get_port(),
+                log_level="warning",
+            )
+        )
+        self.shared_event_loop.run_until_complete(server.serve())
+
+    def run(self):
+        sentry_init()
+        super().run()
+        self.fastapi_app = FastAPI()
+
+        # Register the exposed API routes.
+        for attr_name, attr in vars(type(self)).items():
+            if getattr(attr, EXPOSED_FLAG, False):
+                route_path = f"/{attr_name}"
+                self.fastapi_app.add_api_route(
+                    route_path,
+                    self._create_fastapi_endpoint(attr),
+                    methods=["POST"],
+                )
+        self.fastapi_app.add_api_route(
+            "/health_check", self.health_check, methods=["POST"]
+        )
+        self.fastapi_app.add_exception_handler(
+            ValueError, self._handle_internal_http_error(400)
+        )
+        self.fastapi_app.add_exception_handler(
+            Exception, self._handle_internal_http_error(500)
         )
 
-        Pyro5.config.THREADPOOL_SIZE = maximum_connection_thread_count  # type: ignore
-        daemon = Pyro5.api.Daemon(host=config.pyro_host, port=self.get_port())
-        self.uri = daemon.register(self, objectId=self.service_name)
-        logger.info(f"[{self.service_name}] Connected to Pyro; URI = {self.uri}")
-        daemon.requestLoop()
+        # Start the FastAPI server in a separate thread.
+        api_thread = threading.Thread(target=self.__start_fastapi, daemon=True)
+        api_thread.start()
 
-    def __start_async_loop(self):
-        self.shared_event_loop.run_forever()
+        # Run the main service loop (blocking).
+        self.run_service()
 
 
-# --------- UTILITIES --------- #
-
-
+# --------------------------------------------------
+# HTTP Client utilities for dynamic service client abstraction
+# --------------------------------------------------
 AS = TypeVar("AS", bound=AppService)
 
 
-class PyroClient:
-    proxy: Pyro5.api.Proxy
+class AppServiceClient(ABC):
+    @classmethod
+    @abstractmethod
+    def get_service_type(cls) -> Type[AppService]:
+        pass
+
+    def health_check(self):
+        pass
+
+    def close(self):
+        pass
 
 
-def close_service_client(client: AppService) -> None:
-    if isinstance(client, PyroClient):
-        client.proxy._pyroRelease()
-    else:
-        raise RuntimeError(f"Client {client.__class__} is not a Pyro client.")
+ASC = TypeVar("ASC", bound=AppServiceClient)
 
 
-def get_service_client(service_type: Type[AS]) -> AS:
-    service_name = service_type.service_name
-
-    class DynamicClient(PyroClient):
-        @conn_retry("Pyro", f"Connecting to [{service_name}]")
+@conn_retry("AppService client", "Creating service client", max_retry=api_comm_retry)
+def get_service_client(
+    service_client_type: Type[ASC],
+    call_timeout: int | None = api_call_timeout,
+    health_check: bool = True,
+) -> ASC:
+    class DynamicClient:
         def __init__(self):
-            host = os.environ.get(f"{service_name.upper()}_HOST", pyro_host)
-            uri = f"PYRO:{service_type.service_name}@{host}:{service_type.get_port()}"
-            logger.debug(f"Connecting to service [{service_name}]. URI = {uri}")
-            self.proxy = Pyro5.api.Proxy(uri)
-            # Attempt to bind to ensure the connection is established
-            self.proxy._pyroBind()
-            logger.debug(f"Successfully connected to service [{service_name}]")
+            service_type = service_client_type.get_service_type()
+            host = service_type.get_host()
+            port = service_type.get_port()
+            self.base_url = f"http://{host}:{port}".rstrip("/")
+
+        @cached_property
+        def sync_client(self) -> httpx.Client:
+            return httpx.Client(
+                base_url=self.base_url,
+                timeout=call_timeout,
+            )
+
+        @cached_property
+        def async_client(self) -> httpx.AsyncClient:
+            return httpx.AsyncClient(
+                base_url=self.base_url,
+                timeout=call_timeout,
+            )
+
+        def _handle_call_method_response(
+            self, response: httpx.Response, method_name: str
+        ) -> Any:
+            try:
+                response.raise_for_status()
+                return response.json()
+            except httpx.HTTPStatusError as e:
+                logger.error(f"HTTP error in {method_name}: {e.response.text}")
+                error = RemoteCallError.model_validate(e.response.json())
+                # DEBUG HELP: if you made a custom exception, make sure you override self.args to be how to make your exception
+                raise EXCEPTION_MAPPING.get(error.type, Exception)(
+                    *(error.args or [str(e)])
+                )
+
+        def _call_method_sync(self, method_name: str, **kwargs) -> Any:
+            return self._handle_call_method_response(
+                method_name=method_name,
+                response=self.sync_client.post(method_name, json=to_dict(kwargs)),
+            )
+
+        async def _call_method_async(self, method_name: str, **kwargs) -> Any:
+            return self._handle_call_method_response(
+                method_name=method_name,
+                response=await self.async_client.post(
+                    method_name, json=to_dict(kwargs)
+                ),
+            )
+
+        async def aclose(self):
+            self.sync_client.close()
+            await self.async_client.aclose()
+
+        def close(self):
+            self.sync_client.close()
+
+        def _get_params(self, signature: inspect.Signature, *args, **kwargs) -> dict:
+            if args:
+                arg_names = list(signature.parameters.keys())
+                if arg_names[0] in ("self", "cls"):
+                    arg_names = arg_names[1:]
+                kwargs.update(dict(zip(arg_names, args)))
+            return kwargs
+
+        def _get_return(self, expected_return: TypeAdapter | None, result: Any) -> Any:
+            if expected_return:
+                return expected_return.validate_python(result)
+            return result
 
         def __getattr__(self, name: str) -> Callable[..., Any]:
-            res = getattr(self.proxy, name)
-            return res
+            original_func = getattr(service_client_type, name, None)
+            if original_func is None:
+                raise AttributeError(
+                    f"Method {name} not found in {service_client_type}"
+                )
+            else:
+                name = original_func.__name__
 
-    return cast(AS, DynamicClient())
+            sig = inspect.signature(original_func)
+            ret_ann = sig.return_annotation
+            if ret_ann != inspect.Signature.empty:
+                expected_return = TypeAdapter(ret_ann)
+            else:
+                expected_return = None
+
+            if inspect.iscoroutinefunction(original_func):
+
+                async def async_method(*args, **kwargs) -> Any:
+                    params = self._get_params(sig, *args, **kwargs)
+                    result = await self._call_method_async(name, **params)
+                    return self._get_return(expected_return, result)
+
+                return async_method
+            else:
+
+                def sync_method(*args, **kwargs) -> Any:
+                    params = self._get_params(sig, *args, **kwargs)
+                    result = self._call_method_sync(name, **params)
+                    return self._get_return(expected_return, result)
+
+                return sync_method
+
+    client = cast(ASC, DynamicClient())
+    if health_check:
+        client.health_check()
+
+    return client
 
 
-builtin_types = [*vars(builtins).values(), NoneType, Enum]
+def endpoint_to_sync(
+    func: Callable[Concatenate[Any, P], Awaitable[R]],
+) -> Callable[Concatenate[Any, P], R]:
+    """
+    Produce a *typed* stub that **looks** synchronous to the type‑checker.
+    """
+
+    def _stub(*args: P.args, **kwargs: P.kwargs) -> R:  # pragma: no cover
+        raise RuntimeError("should be intercepted by __getattr__")
+
+    update_wrapper(_stub, func)
+    return cast(Callable[Concatenate[Any, P], R], _stub)
 
 
-def _pydantic_models_from_type_annotation(annotation) -> Iterator[type[BaseModel]]:
-    # Peel Annotated parameters
-    if (origin := get_origin(annotation)) and origin is Annotated:
-        annotation = get_args(annotation)[0]
+def endpoint_to_async(
+    func: Callable[Concatenate[Any, P], R],
+) -> Callable[Concatenate[Any, P], Awaitable[R]]:
+    """
+    The async mirror of `to_sync`.
+    """
 
-    origin = get_origin(annotation)
-    args = get_args(annotation)
+    async def _stub(*args: P.args, **kwargs: P.kwargs) -> R:  # pragma: no cover
+        raise RuntimeError("should be intercepted by __getattr__")
 
-    if origin in (
-        Union,
-        UnionType,
-        list,
-        List,
-        tuple,
-        Tuple,
-        set,
-        Set,
-        frozenset,
-        FrozenSet,
-    ):
-        for arg in args:
-            yield from _pydantic_models_from_type_annotation(arg)
-    elif origin in (dict, Dict):
-        key_type, value_type = args
-        yield from _pydantic_models_from_type_annotation(key_type)
-        yield from _pydantic_models_from_type_annotation(value_type)
-    elif origin in (Awaitable, Coroutine):
-        # For coroutines and awaitables, check the return type
-        return_type = args[-1]
-        yield from _pydantic_models_from_type_annotation(return_type)
-    else:
-        annotype = annotation if origin is None else origin
-
-        # Exclude generic types and aliases
-        if (
-            annotype is not None
-            and not hasattr(typing, getattr(annotype, "__name__", ""))
-            and isinstance(annotype, type)
-        ):
-            if issubclass(annotype, BaseModel):
-                yield annotype
-            elif annotype not in builtin_types and not issubclass(annotype, Enum):
-                raise TypeError(f"Unsupported type encountered: {annotype}")
+    update_wrapper(_stub, func)
+    return cast(Callable[Concatenate[Any, P], Awaitable[R]], _stub)

@@ -1,4 +1,4 @@
-import { LibraryAgent, Schedule } from "@/lib/autogpt-server-api";
+import { LibraryAgent, Schedule, ScheduleID } from "@/lib/autogpt-server-api";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import {
@@ -36,7 +36,7 @@ import { Label } from "../ui/label";
 interface SchedulesTableProps {
   schedules: Schedule[];
   agents: LibraryAgent[];
-  onRemoveSchedule: (scheduleId: string, enabled: boolean) => void;
+  onRemoveSchedule: (scheduleId: ScheduleID, enabled: boolean) => void;
   sortColumn: keyof Schedule;
   sortDirection: "asc" | "desc";
   onSort: (column: keyof Schedule) => void;
@@ -73,7 +73,7 @@ export const SchedulesTable = ({
       return String(bValue).localeCompare(String(aValue));
     });
 
-  const handleToggleSchedule = (scheduleId: string, enabled: boolean) => {
+  const handleToggleSchedule = (scheduleId: ScheduleID, enabled: boolean) => {
     onRemoveSchedule(scheduleId, enabled);
     if (!enabled) {
       toast({
@@ -90,8 +90,8 @@ export const SchedulesTable = ({
   const handleAgentSelect = (agentId: string) => {
     setSelectedAgent(agentId);
     const agent = agents.find((a) => a.id === agentId);
-    setMaxVersion(agent!.agent_version);
-    setSelectedVersion(agent!.agent_version);
+    setMaxVersion(agent!.graph_version);
+    setSelectedVersion(agent!.graph_version);
   };
 
   const handleVersionSelect = (version: string) => {
@@ -120,7 +120,7 @@ export const SchedulesTable = ({
     try {
       await new Promise((resolve) => setTimeout(resolve, 100));
       router.push(
-        `/build?flowID=${agent.agent_id}&flowVersion=${agent.agent_version}&open_scheduling=true`,
+        `/build?flowID=${agent.graph_id}&flowVersion=${agent.graph_version}&open_scheduling=true`,
       );
     } catch (error) {
       console.error("Navigation error:", error);
@@ -177,14 +177,14 @@ export const SchedulesTable = ({
 
       <div className="mb-4 flex items-center justify-between">
         <h3 className="text-lg font-semibold">Schedules</h3>
-        <div className="flex gap-2">
+        <div className="flex flex-wrap gap-2">
           <Select onValueChange={setSelectedFilter}>
             <SelectTrigger className="h-8 w-[180px] rounded-md px-3 text-xs">
               <SelectValue placeholder="Filter by graph" />
             </SelectTrigger>
             <SelectContent className="text-xs">
               {agents.map((agent) => (
-                <SelectItem key={agent.id} value={agent.agent_id}>
+                <SelectItem key={agent.id} value={agent.graph_id}>
                   {agent.name}
                 </SelectItem>
               ))}
@@ -237,7 +237,7 @@ export const SchedulesTable = ({
               filteredAndSortedSchedules.map((schedule) => (
                 <TableRow key={schedule.id}>
                   <TableCell className="font-medium">
-                    {agents.find((a) => a.agent_id === schedule.graph_id)
+                    {agents.find((a) => a.graph_id === schedule.graph_id)
                       ?.name || schedule.graph_id}
                   </TableCell>
                   <TableCell>{schedule.graph_version}</TableCell>

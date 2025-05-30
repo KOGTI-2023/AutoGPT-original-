@@ -1,9 +1,10 @@
 import logging
-from typing import TYPE_CHECKING, Callable, Optional, cast
+from typing import TYPE_CHECKING, Optional, cast
 
-from backend.data.block import BlockSchema, BlockWebhookConfig, get_block
+from backend.data.block import BlockSchema, BlockWebhookConfig
 from backend.data.graph import set_node_webhook
-from backend.integrations.webhooks import WEBHOOK_MANAGERS_BY_NAME
+from backend.integrations.creds_manager import IntegrationCredentialsManager
+from backend.integrations.webhooks import get_webhook_manager, supports_webhooks
 
 if TYPE_CHECKING:
     from backend.data.graph import GraphModel, NodeModel
@@ -12,29 +13,20 @@ if TYPE_CHECKING:
     from ._base import BaseWebhooksManager
 
 logger = logging.getLogger(__name__)
+credentials_manager = IntegrationCredentialsManager()
 
 
-async def on_graph_activate(
-    graph: "GraphModel", get_credentials: Callable[[str], "Credentials | None"]
-):
+async def on_graph_activate(graph: "GraphModel", user_id: str):
     """
     Hook to be called when a graph is activated/created.
 
     ⚠️ Assuming node entities are not re-used between graph versions, ⚠️
     this hook calls `on_node_activate` on all nodes in this graph.
-
-    Params:
-        get_credentials: `credentials_id` -> Credentials
     """
-    # Compare nodes in new_graph_version with previous_graph_version
+    get_credentials = credentials_manager.cached_getter(user_id)
     updated_nodes = []
     for new_node in graph.nodes:
-        block = get_block(new_node.block_id)
-        if not block:
-            raise ValueError(
-                f"Node #{new_node.id} is instance of unknown block #{new_node.block_id}"
-            )
-        block_input_schema = cast(BlockSchema, block.input_schema)
+        block_input_schema = cast(BlockSchema, new_node.block.input_schema)
 
         node_credentials = None
         if (
@@ -61,26 +53,17 @@ async def on_graph_activate(
     return graph
 
 
-async def on_graph_deactivate(
-    graph: "GraphModel", get_credentials: Callable[[str], "Credentials | None"]
-):
+async def on_graph_deactivate(graph: "GraphModel", user_id: str):
     """
     Hook to be called when a graph is deactivated/deleted.
 
     ⚠️ Assuming node entities are not re-used between graph versions, ⚠️
     this hook calls `on_node_deactivate` on all nodes in `graph`.
-
-    Params:
-        get_credentials: `credentials_id` -> Credentials
     """
+    get_credentials = credentials_manager.cached_getter(user_id)
     updated_nodes = []
     for node in graph.nodes:
-        block = get_block(node.block_id)
-        if not block:
-            raise ValueError(
-                f"Node #{node.id} is instance of unknown block #{node.block_id}"
-            )
-        block_input_schema = cast(BlockSchema, block.input_schema)
+        block_input_schema = cast(BlockSchema, node.block.input_schema)
 
         node_credentials = None
         if (
@@ -113,17 +96,13 @@ async def on_node_activate(
 ) -> "NodeModel":
     """Hook to be called when the node is activated/created"""
 
-    block = get_block(node.block_id)
-    if not block:
-        raise ValueError(
-            f"Node #{node.id} is instance of unknown block #{node.block_id}"
-        )
+    block = node.block
 
     if not block.webhook_config:
         return node
 
     provider = block.webhook_config.provider
-    if provider not in WEBHOOK_MANAGERS_BY_NAME:
+    if not supports_webhooks(provider):
         raise ValueError(
             f"Block #{block.id} has webhook_config for provider {provider} "
             "which does not support webhooks"
@@ -133,7 +112,7 @@ async def on_node_activate(
         f"Activating webhook node #{node.id} with config {block.webhook_config}"
     )
 
-    webhooks_manager = WEBHOOK_MANAGERS_BY_NAME[provider]()
+    webhooks_manager = get_webhook_manager(provider)
 
     if auto_setup_webhook := isinstance(block.webhook_config, BlockWebhookConfig):
         try:
@@ -224,23 +203,19 @@ async def on_node_deactivate(
     """Hook to be called when node is deactivated/deleted"""
 
     logger.debug(f"Deactivating node #{node.id}")
-    block = get_block(node.block_id)
-    if not block:
-        raise ValueError(
-            f"Node #{node.id} is instance of unknown block #{node.block_id}"
-        )
+    block = node.block
 
     if not block.webhook_config:
         return node
 
     provider = block.webhook_config.provider
-    if provider not in WEBHOOK_MANAGERS_BY_NAME:
+    if not supports_webhooks(provider):
         raise ValueError(
             f"Block #{block.id} has webhook_config for provider {provider} "
             "which does not support webhooks"
         )
 
-    webhooks_manager = WEBHOOK_MANAGERS_BY_NAME[provider]()
+    webhooks_manager = get_webhook_manager(provider)
 
     if node.webhook_id:
         logger.debug(f"Node #{node.id} has webhook_id {node.webhook_id}")

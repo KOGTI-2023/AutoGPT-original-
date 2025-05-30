@@ -30,7 +30,6 @@ export const PublishAgentSelect: React.FC<PublishAgentSelectProps> = ({
   onClose,
   onOpenBuilder,
 }) => {
-  const [selectedAgent, setSelectedAgent] = React.useState<string | null>(null);
   const [selectedAgentId, setSelectedAgentId] = React.useState<string | null>(
     null,
   );
@@ -43,7 +42,6 @@ export const PublishAgentSelect: React.FC<PublishAgentSelectProps> = ({
     agentId: string,
     agentVersion: number,
   ) => {
-    setSelectedAgent(agentName);
     setSelectedAgentId(agentId);
     setSelectedAgentVersion(agentVersion);
     onSelect(agentId, agentVersion);
@@ -68,7 +66,7 @@ export const PublishAgentSelect: React.FC<PublishAgentSelectProps> = ({
           <h3 className="font-poppins text-2xl font-semibold text-neutral-900 dark:text-neutral-100">
             Publish Agent
           </h3>
-          <p className="font-geist text-sm font-normal text-neutral-600 dark:text-neutral-400">
+          <p className="text-sm font-normal text-neutral-600 dark:text-neutral-400">
             Select your project that you&apos;d like to publish
           </p>
         </div>
@@ -137,7 +135,7 @@ export const PublishAgentSelect: React.FC<PublishAgentSelectProps> = ({
                         <p className="font-poppins text-base font-medium leading-normal text-neutral-800 dark:text-neutral-100 sm:text-base">
                           {agent.name}
                         </p>
-                        <small className="font-geist text-xs font-normal leading-[14px] text-neutral-500 dark:text-neutral-400 sm:text-sm">
+                        <small className="text-xs font-normal leading-[14px] text-neutral-500 dark:text-neutral-400 sm:text-sm">
                           Edited {agent.lastEdited}
                         </small>
                       </div>
