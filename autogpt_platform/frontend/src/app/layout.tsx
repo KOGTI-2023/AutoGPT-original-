@@ -1,4 +1,4 @@
-import React, { Suspense } from "react";
+import React from "react";
 import type { Metadata } from "next";
 import { fonts } from "@/components/styles/fonts";
 
@@ -23,6 +23,7 @@ export default async function RootLayout({
     <html
       lang="en"
       className={`${fonts.poppins.variable} ${fonts.sans.variable} ${fonts.mono.variable}`}
+      suppressHydrationWarning
     >
       <head>
         <GoogleAnalytics
