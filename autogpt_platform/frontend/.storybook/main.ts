@@ -6,15 +6,14 @@ const config: StorybookConfig = {
     "@storybook/addon-a11y",
     "@storybook/addon-onboarding",
     "@storybook/addon-links",
-    "@storybook/addon-essentials",
-    "@storybook/addon-interactions",
+    "@storybook/addon-docs",
   ],
   features: {
     experimentalRSC: true,
   },
   framework: {
     name: "@storybook/nextjs",
-    options: {},
+    options: { builder: { useSWC: true } },
   },
   staticDirs: ["../public"],
 };
