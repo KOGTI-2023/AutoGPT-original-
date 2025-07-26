@@ -3,11 +3,19 @@ import logging
 from enum import Enum
 from io import BytesIO
 from pathlib import Path
+from typing import Literal
 
 import aiofiles
+from pydantic import SecretStr
 
 from backend.data.block import Block, BlockCategory, BlockOutput, BlockSchema
-from backend.data.model import SchemaField
+from backend.data.model import (
+    CredentialsField,
+    CredentialsMetaInput,
+    HostScopedCredentials,
+    SchemaField,
+)
+from backend.integrations.providers import ProviderName
 from backend.util.file import (
     MediaFileType,
     get_exec_file_path,
@@ -17,6 +25,30 @@ from backend.util.file import (
 from backend.util.request import Requests
 
 logger = logging.getLogger(name=__name__)
+
+
+# Host-scoped credentials for HTTP requests
+HttpCredentials = CredentialsMetaInput[
+    Literal[ProviderName.HTTP], Literal["host_scoped"]
+]
+
+
+TEST_CREDENTIALS = HostScopedCredentials(
+    id="01234567-89ab-cdef-0123-456789abcdef",
+    provider="http",
+    host="api.example.com",
+    headers={
+        "Authorization": SecretStr("Bearer test-token"),
+        "X-API-Key": SecretStr("test-api-key"),
+    },
+    title="Mock HTTP Host-Scoped Credentials",
+)
+TEST_CREDENTIALS_INPUT = {
+    "provider": TEST_CREDENTIALS.provider,
+    "id": TEST_CREDENTIALS.id,
+    "type": TEST_CREDENTIALS.type,
+    "title": TEST_CREDENTIALS.title,
+}
 
 
 class HttpMethod(Enum):
@@ -81,6 +113,7 @@ class SendWebRequestBlock(Block):
         graph_exec_id: str,
         files_name: str,
         files: list[MediaFileType],
+        user_id: str,
     ) -> list[tuple[str, tuple[str, BytesIO, str]]]:
         """
         Prepare files for the request by storing them and reading their content.
@@ -92,7 +125,7 @@ class SendWebRequestBlock(Block):
         for media in files:
             # Normalise to a list so we can repeat the same key
             rel_path = await store_media_file(
-                graph_exec_id, media, return_content=False
+                graph_exec_id, media, user_id, return_content=False
             )
             abs_path = get_exec_file_path(graph_exec_id, rel_path)
             async with aiofiles.open(abs_path, "rb") as f:
@@ -104,7 +137,7 @@ class SendWebRequestBlock(Block):
         return files_payload
 
     async def run(
-        self, input_data: Input, *, graph_exec_id: str, **kwargs
+        self, input_data: Input, *, graph_exec_id: str, user_id: str, **kwargs
     ) -> BlockOutput:
         # ─── Parse/normalise body ────────────────────────────────────
         body = input_data.body
@@ -135,7 +168,7 @@ class SendWebRequestBlock(Block):
         files_payload: list[tuple[str, tuple[str, BytesIO, str]]] = []
         if use_files:
             files_payload = await self._prepare_files(
-                graph_exec_id, input_data.files_name, input_data.files
+                graph_exec_id, input_data.files_name, input_data.files, user_id
             )
 
         # Enforce body format rules
@@ -169,3 +202,63 @@ class SendWebRequestBlock(Block):
             yield "client_error", result
         else:
             yield "server_error", result
+
+
+class SendAuthenticatedWebRequestBlock(SendWebRequestBlock):
+    class Input(SendWebRequestBlock.Input):
+        credentials: HttpCredentials = CredentialsField(
+            description="HTTP host-scoped credentials for automatic header injection",
+            discriminator="url",
+        )
+
+    def __init__(self):
+        Block.__init__(
+            self,
+            id="fff86bcd-e001-4bad-a7f6-2eae4720c8dc",
+            description="Make an authenticated HTTP request with host-scoped credentials (JSON / form / multipart).",
+            categories={BlockCategory.OUTPUT},
+            input_schema=SendAuthenticatedWebRequestBlock.Input,
+            output_schema=SendWebRequestBlock.Output,
+            test_credentials=TEST_CREDENTIALS,
+        )
+
+    async def run(  # type: ignore[override]
+        self,
+        input_data: Input,
+        *,
+        graph_exec_id: str,
+        credentials: HostScopedCredentials,
+        user_id: str,
+        **kwargs,
+    ) -> BlockOutput:
+        # Create SendWebRequestBlock.Input from our input (removing credentials field)
+        base_input = SendWebRequestBlock.Input(
+            url=input_data.url,
+            method=input_data.method,
+            headers=input_data.headers,
+            json_format=input_data.json_format,
+            body=input_data.body,
+            files_name=input_data.files_name,
+            files=input_data.files,
+        )
+
+        # Apply host-scoped credentials to headers
+        extra_headers = {}
+        if credentials.matches_url(input_data.url):
+            logger.debug(
+                f"Applying host-scoped credentials {credentials.id} for URL {input_data.url}"
+            )
+            extra_headers.update(credentials.get_headers_dict())
+        else:
+            logger.warning(
+                f"Host-scoped credentials {credentials.id} do not match URL {input_data.url}"
+            )
+
+        # Merge with user-provided headers (user headers take precedence)
+        base_input.headers = {**extra_headers, **input_data.headers}
+
+        # Use parent class run method
+        async for output_name, output_data in super().run(
+            base_input, graph_exec_id=graph_exec_id, user_id=user_id, **kwargs
+        ):
+            yield output_name, output_data

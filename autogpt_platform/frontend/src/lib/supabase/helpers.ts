@@ -1,4 +1,5 @@
-// Session management constants and utilities
+import { type CookieOptions } from "@supabase/ssr";
+import { SupabaseClient } from "@supabase/supabase-js";
 
 export const PROTECTED_PAGES = [
   "/monitor",
@@ -14,6 +15,14 @@ export const ADMIN_PAGES = ["/admin"] as const;
 export const STORAGE_KEYS = {
   LOGOUT: "supabase-logout",
 } as const;
+
+export function getCookieSettings(): Partial<CookieOptions> {
+  return {
+    secure: process.env.NODE_ENV === "production",
+    sameSite: "lax",
+    httpOnly: true,
+  } as const;
+}
 
 // Page protection utilities
 export function isProtectedPage(pathname: string): boolean {
@@ -80,4 +89,39 @@ export function setupSessionEventListeners(
       window.removeEventListener("storage", onStorageChange);
     },
   };
+}
+
+export interface CodeExchangeResult {
+  success: boolean;
+  error?: string;
+}
+
+export async function exchangePasswordResetCode(
+  supabase: SupabaseClient<any, "public", any>,
+  code: string,
+): Promise<CodeExchangeResult> {
+  try {
+    const { data, error } = await supabase.auth.exchangeCodeForSession(code);
+
+    if (error) {
+      return {
+        success: false,
+        error: error.message,
+      };
+    }
+
+    if (!data.session) {
+      return {
+        success: false,
+        error: "Failed to create session",
+      };
+    }
+
+    return { success: true };
+  } catch (error) {
+    return {
+      success: false,
+      error: error instanceof Error ? error.message : "Unknown error",
+    };
+  }
 }

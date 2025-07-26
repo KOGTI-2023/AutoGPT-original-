@@ -22,6 +22,7 @@ from typing import (
 
 import httpx
 import uvicorn
+from autogpt_libs.logging.utils import generate_uvicorn_config
 from fastapi import FastAPI, Request, responses
 from pydantic import BaseModel, TypeAdapter, create_model
 from tenacity import (
@@ -31,7 +32,7 @@ from tenacity import (
     wait_exponential_jitter,
 )
 
-from backend.util.exceptions import InsufficientBalanceError
+import backend.util.exceptions as exceptions
 from backend.util.json import to_dict
 from backend.util.metrics import sentry_init
 from backend.util.process import AppProcess, get_service_name
@@ -106,13 +107,25 @@ EXCEPTION_MAPPING = {
         ValueError,
         TimeoutError,
         ConnectionError,
-        InsufficientBalanceError,
+        *[
+            ErrorType
+            for _, ErrorType in inspect.getmembers(exceptions)
+            if inspect.isclass(ErrorType)
+            and issubclass(ErrorType, Exception)
+            and ErrorType.__module__ == exceptions.__name__
+        ],
     ]
 }
 
 
 class AppService(BaseAppService, ABC):
     fastapi_app: FastAPI
+    log_level: str = "info"
+
+    def set_log_level(self, log_level: str):
+        """Set the uvicorn log level. Returns self for chaining."""
+        self.log_level = log_level
+        return self
 
     @staticmethod
     def _handle_internal_http_error(status_code: int = 500, log_error: bool = True):
@@ -185,12 +198,14 @@ class AppService(BaseAppService, ABC):
         logger.info(
             f"[{self.service_name}] Starting RPC server at http://{api_host}:{self.get_port()}"
         )
+
         server = uvicorn.Server(
             uvicorn.Config(
                 self.fastapi_app,
                 host=api_host,
                 port=self.get_port(),
-                log_level="warning",
+                log_config=generate_uvicorn_config(),
+                log_level=self.log_level,
             )
         )
         self.shared_event_loop.run_until_complete(server.serve())
@@ -210,7 +225,10 @@ class AppService(BaseAppService, ABC):
                     methods=["POST"],
                 )
         self.fastapi_app.add_api_route(
-            "/health_check", self.health_check, methods=["POST"]
+            "/health_check", self.health_check, methods=["POST", "GET"]
+        )
+        self.fastapi_app.add_api_route(
+            "/health_check_async", self.health_check, methods=["POST", "GET"]
         )
         self.fastapi_app.add_exception_handler(
             ValueError, self._handle_internal_http_error(400)
@@ -240,6 +258,9 @@ class AppServiceClient(ABC):
         pass
 
     def health_check(self):
+        pass
+
+    async def health_check_async(self):
         pass
 
     def close(self):
