@@ -3,6 +3,9 @@ import {
   getServerAuthToken,
 } from "@/lib/autogpt-server-api/helpers";
 import { isServerSide } from "@/lib/utils/is-server-side";
+import { getAgptServerBaseUrl } from "@/lib/env-config";
+
+import { transformDates } from "./date-transformer";
 
 const FRONTEND_BASE_URL =
   process.env.NEXT_PUBLIC_FRONTEND_BASE_URL || "http://localhost:3000";
@@ -12,9 +15,7 @@ const getBaseUrl = (): string => {
   if (!isServerSide()) {
     return API_PROXY_BASE_URL;
   } else {
-    return (
-      process.env.NEXT_PUBLIC_AGPT_SERVER_BASE_URL || "http://localhost:8006"
-    );
+    return getAgptServerBaseUrl();
   }
 };
 
@@ -99,9 +100,12 @@ export const customMutator = async <T = any>(
 
   const response_data = await getBody<T>(response);
 
+  // Transform ISO date strings to Date objects in the response data
+  const transformedData = transformDates(response_data);
+
   return {
     status: response.status,
-    data: response_data,
+    data: transformedData,
     headers: response.headers,
   } as T;
 };

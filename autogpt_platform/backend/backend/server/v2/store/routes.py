@@ -162,7 +162,7 @@ async def get_agents(
     try:
         agents = await backend.server.v2.store.db.get_store_agents(
             featured=featured,
-            creator=creator,
+            creators=[creator] if creator else None,
             sorted_by=sorted_by,
             search_query=search_query,
             category=category,
@@ -562,6 +562,47 @@ async def create_submission(
             status_code=500,
             content={"detail": "An error occurred while creating the store submission"},
         )
+
+
+@router.put(
+    "/submissions/{store_listing_version_id}",
+    summary="Edit store submission",
+    tags=["store", "private"],
+    dependencies=[fastapi.Depends(autogpt_libs.auth.middleware.auth_middleware)],
+    response_model=backend.server.v2.store.model.StoreSubmission,
+)
+async def edit_submission(
+    store_listing_version_id: str,
+    submission_request: backend.server.v2.store.model.StoreSubmissionEditRequest,
+    user_id: typing.Annotated[
+        str, fastapi.Depends(autogpt_libs.auth.depends.get_user_id)
+    ],
+):
+    """
+    Edit an existing store listing submission.
+
+    Args:
+        store_listing_version_id (str): ID of the store listing version to edit
+        submission_request (StoreSubmissionRequest): The updated submission details
+        user_id (str): ID of the authenticated user editing the listing
+
+    Returns:
+        StoreSubmission: The updated store submission
+
+    Raises:
+        HTTPException: If there is an error editing the submission
+    """
+    return await backend.server.v2.store.db.edit_store_submission(
+        user_id=user_id,
+        store_listing_version_id=store_listing_version_id,
+        name=submission_request.name,
+        video_url=submission_request.video_url,
+        image_urls=submission_request.image_urls,
+        description=submission_request.description,
+        sub_heading=submission_request.sub_heading,
+        categories=submission_request.categories,
+        changes_summary=submission_request.changes_summary,
+    )
 
 
 @router.post(
