@@ -5,7 +5,7 @@ import {
 } from "@/app/api/__generated__/endpoints/auth/auth";
 import { SettingsForm } from "@/app/(platform)/profile/(user)/settings/components/SettingsForm/SettingsForm";
 import { useSupabase } from "@/lib/supabase/hooks/useSupabase";
-import { useTimezoneDetection } from "@/hooks/useTimezoneDetection";
+import { useTimezoneDetection } from "@/app/(platform)/profile/(user)/settings/useTimezoneDetection";
 import * as React from "react";
 import SettingsLoading from "./loading";
 import { redirect } from "next/navigation";
@@ -17,29 +17,21 @@ export default function SettingsPage() {
     isError: preferencesError,
     isLoading: preferencesLoading,
   } = useGetV1GetNotificationPreferences({
-    query: {
-      select: (res) => {
-        return res.data;
-      },
-    },
+    query: { select: (res) => (res.status === 200 ? res.data : null) },
   });
 
-  const { data: timezoneData, isLoading: timezoneLoading } =
+  const { data: timezone, isLoading: timezoneLoading } =
     useGetV1GetUserTimezone({
       query: {
         select: (res) => {
-          return res.data;
+          return res.status === 200 ? String(res.data.timezone) : "not-set";
         },
       },
     });
 
-  const { user, isUserLoading } = useSupabase();
-
-  // Auto-detect timezone if it's not set
-  const timezone = timezoneData?.timezone
-    ? String(timezoneData.timezone)
-    : "not-set";
   useTimezoneDetection(timezone);
+
+  const { user, isUserLoading } = useSupabase();
 
   if (preferencesLoading || isUserLoading || timezoneLoading) {
     return <SettingsLoading />;
@@ -50,7 +42,7 @@ export default function SettingsPage() {
   }
 
   if (preferencesError || !preferences || !preferences.preferences) {
-    return "Errror..."; // TODO: Will use a Error reusable components from Block Menu redesign
+    return "Error..."; // TODO: Will use a Error reusable components from Block Menu redesign
   }
 
   return (

@@ -4,11 +4,9 @@ import { createBrowserClient } from "@supabase/ssr";
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { Key, storage } from "@/services/storage/local-storage";
 import {
-  getAgptServerApiUrl,
-  getAgptWsServerUrl,
-  getSupabaseUrl,
-  getSupabaseAnonKey,
-} from "@/lib/env-config";
+  IMPERSONATION_HEADER_NAME,
+  IMPERSONATION_STORAGE_KEY,
+} from "@/lib/constants";
 import * as Sentry from "@sentry/nextjs";
 import type {
   AddUserCreditsResponse,
@@ -73,9 +71,9 @@ import type {
   UserPasswordCredentials,
   UsersBalanceHistoryResponse,
 } from "./types";
-import { isServerSide } from "../utils/is-server-side";
+import { environment } from "@/services/environment";
 
-const isClient = !isServerSide();
+const isClient = environment.isClientSide();
 
 export default class BackendAPI {
   private baseUrl: string;
@@ -93,8 +91,8 @@ export default class BackendAPI {
   heartbeatTimeoutID: number | null = null;
 
   constructor(
-    baseUrl: string = getAgptServerApiUrl(),
-    wsUrl: string = getAgptWsServerUrl(),
+    baseUrl: string = environment.getAGPTServerApiUrl(),
+    wsUrl: string = environment.getAGPTWsServerUrl(),
   ) {
     this.baseUrl = baseUrl;
     this.wsUrl = wsUrl;
@@ -102,9 +100,13 @@ export default class BackendAPI {
 
   private async getSupabaseClient(): Promise<SupabaseClient | null> {
     return isClient
-      ? createBrowserClient(getSupabaseUrl(), getSupabaseAnonKey(), {
-          isSingleton: true,
-        })
+      ? createBrowserClient(
+          environment.getSupabaseUrl(),
+          environment.getSupabaseAnonKey(),
+          {
+            isSingleton: true,
+          },
+        )
       : await getServerSupabase();
   }
 
@@ -273,7 +275,7 @@ export default class BackendAPI {
     version: number,
     inputs: { [key: string]: any } = {},
     credentials_inputs: { [key: string]: CredentialsMetaInput } = {},
-  ): Promise<{ graph_exec_id: GraphExecutionID }> {
+  ): Promise<GraphExecutionMeta> {
     return this._request("POST", `/graphs/${id}/execute/${version}`, {
       inputs,
       credentials_inputs,
@@ -662,6 +664,13 @@ export default class BackendAPI {
     return this._get("/library/agents", params);
   }
 
+  listFavoriteLibraryAgents(params?: {
+    page?: number;
+    page_size?: number;
+  }): Promise<LibraryAgentResponse> {
+    return this._get("/library/agents/favorites", params);
+  }
+
   getLibraryAgent(id: LibraryAgentID): Promise<LibraryAgent> {
     return this._get(`/library/agents/${id}`);
   }
@@ -772,10 +781,12 @@ export default class BackendAPI {
 
   executeLibraryAgentPreset(
     presetID: LibraryAgentPresetID,
-    inputs?: { [key: string]: any },
-  ): Promise<{ id: GraphExecutionID }> {
+    inputs?: Record<string, any>,
+    credential_inputs?: Record<string, CredentialsMetaInput>,
+  ): Promise<GraphExecutionMeta> {
     return this._request("POST", `/library/presets/${presetID}/execute`, {
       inputs,
+      credential_inputs,
     });
   }
 
@@ -1006,11 +1017,30 @@ export default class BackendAPI {
       url = buildUrlWithQuery(url, payload);
     }
 
+    // Prepare headers with admin impersonation support
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+    };
+
+    if (environment.isClientSide()) {
+      try {
+        const impersonatedUserId = sessionStorage.getItem(
+          IMPERSONATION_STORAGE_KEY,
+        );
+        if (impersonatedUserId) {
+          headers[IMPERSONATION_HEADER_NAME] = impersonatedUserId;
+        }
+      } catch (_error) {
+        console.error(
+          "Admin impersonation: Failed to access sessionStorage:",
+          _error,
+        );
+      }
+    }
+
     const response = await fetch(url, {
       method,
-      headers: {
-        "Content-Type": "application/json",
-      },
+      headers,
       body: !payloadAsQuery && payload ? JSON.stringify(payload) : undefined,
       credentials: "include",
     });
@@ -1117,6 +1147,11 @@ export default class BackendAPI {
   }
 
   async connectWebSocket(): Promise<void> {
+    // Do not attempt to connect if a disconnect intent is present (e.g., during logout)
+    if (this._hasDisconnectIntent()) {
+      return;
+    }
+
     this.isIntentionallyDisconnected = false;
     return (this.wsConnecting ??= new Promise(async (resolve, reject) => {
       try {
@@ -1130,7 +1165,19 @@ export default class BackendAPI {
           }
         } catch (error) {
           console.warn("Failed to get token for WebSocket connection:", error);
-          // Continue with empty token, connection might still work
+          // Intentionally fall through; we'll bail out below if no token is available
+        }
+
+        // If we don't have a token, skip attempting a connection.
+        if (!token) {
+          console.info(
+            "[BackendAPI] Skipping WebSocket connect: no auth token available",
+          );
+          // Resolve first, then clear wsConnecting to avoid races for awaiters
+          resolve();
+          this.wsConnecting = null;
+          this.webSocket = null;
+          return;
         }
 
         const wsUrlWithToken = `${this.wsUrl}?token=${token}`;
@@ -1169,6 +1216,9 @@ export default class BackendAPI {
           if (!wasIntentional) {
             this.wsOnDisconnectHandlers.forEach((handler) => handler());
             setTimeout(() => this.connectWebSocket().then(resolve), 1000);
+          } else {
+            // Ensure pending connect calls settle on intentional close
+            resolve();
           }
         };
 
@@ -1188,9 +1238,14 @@ export default class BackendAPI {
   disconnectWebSocket() {
     this.isIntentionallyDisconnected = true;
     this._stopWSHeartbeat(); // Stop heartbeat when disconnecting
-    if (this.webSocket && this.webSocket.readyState === WebSocket.OPEN) {
+    if (
+      this.webSocket &&
+      (this.webSocket.readyState === WebSocket.OPEN ||
+        this.webSocket.readyState === WebSocket.CONNECTING)
+    ) {
       this.webSocket.close();
     }
+    this.wsConnecting = null;
   }
 
   private _hasDisconnectIntent(): boolean {

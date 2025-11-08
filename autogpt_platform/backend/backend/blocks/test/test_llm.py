@@ -30,7 +30,6 @@ class TestLLMStatsTracking:
                 credentials=llm.TEST_CREDENTIALS,
                 llm_model=llm.LlmModel.GPT4O,
                 prompt=[{"role": "user", "content": "Hello"}],
-                json_format=False,
                 max_tokens=100,
             )
 
@@ -42,6 +41,8 @@ class TestLLMStatsTracking:
     @pytest.mark.asyncio
     async def test_ai_structured_response_block_tracks_stats(self):
         """Test that AIStructuredResponseGeneratorBlock correctly tracks stats."""
+        from unittest.mock import patch
+
         import backend.blocks.llm as llm
 
         block = llm.AIStructuredResponseGeneratorBlock()
@@ -51,7 +52,7 @@ class TestLLMStatsTracking:
             return llm.LLMResponse(
                 raw_response="",
                 prompt=[],
-                response='{"key1": "value1", "key2": "value2"}',
+                response='<json_output id="test123456">{"key1": "value1", "key2": "value2"}</json_output>',
                 tool_calls=None,
                 prompt_tokens=15,
                 completion_tokens=25,
@@ -69,10 +70,12 @@ class TestLLMStatsTracking:
         )
 
         outputs = {}
-        async for output_name, output_data in block.run(
-            input_data, credentials=llm.TEST_CREDENTIALS
-        ):
-            outputs[output_name] = output_data
+        # Mock secrets.token_hex to return consistent ID
+        with patch("secrets.token_hex", return_value="test123456"):
+            async for output_name, output_data in block.run(
+                input_data, credentials=llm.TEST_CREDENTIALS
+            ):
+                outputs[output_name] = output_data
 
         # Check stats
         assert block.execution_stats.input_token_count == 15
@@ -143,7 +146,7 @@ class TestLLMStatsTracking:
                 return llm.LLMResponse(
                     raw_response="",
                     prompt=[],
-                    response='{"wrong": "format"}',
+                    response='<json_output id="test123456">{"wrong": "format"}</json_output>',
                     tool_calls=None,
                     prompt_tokens=10,
                     completion_tokens=15,
@@ -154,7 +157,7 @@ class TestLLMStatsTracking:
                 return llm.LLMResponse(
                     raw_response="",
                     prompt=[],
-                    response='{"key1": "value1", "key2": "value2"}',
+                    response='<json_output id="test123456">{"key1": "value1", "key2": "value2"}</json_output>',
                     tool_calls=None,
                     prompt_tokens=20,
                     completion_tokens=25,
@@ -173,10 +176,12 @@ class TestLLMStatsTracking:
         )
 
         outputs = {}
-        async for output_name, output_data in block.run(
-            input_data, credentials=llm.TEST_CREDENTIALS
-        ):
-            outputs[output_name] = output_data
+        # Mock secrets.token_hex to return consistent ID
+        with patch("secrets.token_hex", return_value="test123456"):
+            async for output_name, output_data in block.run(
+                input_data, credentials=llm.TEST_CREDENTIALS
+            ):
+                outputs[output_name] = output_data
 
         # Check stats - should accumulate both calls
         # For 2 attempts: attempt 1 (failed) + attempt 2 (success) = 2 total
@@ -269,7 +274,8 @@ class TestLLMStatsTracking:
                 mock_response.choices = [
                     MagicMock(
                         message=MagicMock(
-                            content='{"summary": "Test chunk summary"}', tool_calls=None
+                            content='<json_output id="test123456">{"summary": "Test chunk summary"}</json_output>',
+                            tool_calls=None,
                         )
                     )
                 ]
@@ -277,7 +283,7 @@ class TestLLMStatsTracking:
                 mock_response.choices = [
                     MagicMock(
                         message=MagicMock(
-                            content='{"final_summary": "Test final summary"}',
+                            content='<json_output id="test123456">{"final_summary": "Test final summary"}</json_output>',
                             tool_calls=None,
                         )
                     )
@@ -298,11 +304,13 @@ class TestLLMStatsTracking:
                 max_tokens=1000,  # Large enough to avoid chunking
             )
 
-            outputs = {}
-            async for output_name, output_data in block.run(
-                input_data, credentials=llm.TEST_CREDENTIALS
-            ):
-                outputs[output_name] = output_data
+            # Mock secrets.token_hex to return consistent ID
+            with patch("secrets.token_hex", return_value="test123456"):
+                outputs = {}
+                async for output_name, output_data in block.run(
+                    input_data, credentials=llm.TEST_CREDENTIALS
+                ):
+                    outputs[output_name] = output_data
 
             print(f"Actual calls made: {call_count}")
             print(f"Block stats: {block.execution_stats}")
@@ -354,7 +362,7 @@ class TestLLMStatsTracking:
         assert block.execution_stats.llm_call_count == 1
 
         # Check output
-        assert outputs["response"] == {"response": "AI response to conversation"}
+        assert outputs["response"] == "AI response to conversation"
 
     @pytest.mark.asyncio
     async def test_ai_list_generator_with_retries(self):
@@ -457,7 +465,7 @@ class TestLLMStatsTracking:
             return llm.LLMResponse(
                 raw_response="",
                 prompt=[],
-                response='{"result": "test"}',
+                response='<json_output id="test123456">{"result": "test"}</json_output>',
                 tool_calls=None,
                 prompt_tokens=10,
                 completion_tokens=20,
@@ -476,10 +484,12 @@ class TestLLMStatsTracking:
 
         # Run the block
         outputs = {}
-        async for output_name, output_data in block.run(
-            input_data, credentials=llm.TEST_CREDENTIALS
-        ):
-            outputs[output_name] = output_data
+        # Mock secrets.token_hex to return consistent ID
+        with patch("secrets.token_hex", return_value="test123456"):
+            async for output_name, output_data in block.run(
+                input_data, credentials=llm.TEST_CREDENTIALS
+            ):
+                outputs[output_name] = output_data
 
         # Block finished - now grab and assert stats
         assert block.execution_stats is not None
@@ -490,3 +500,181 @@ class TestLLMStatsTracking:
         # Check output
         assert "response" in outputs
         assert outputs["response"] == {"result": "test"}
+
+
+class TestAITextSummarizerValidation:
+    """Test that AITextSummarizerBlock validates LLM responses are strings."""
+
+    @pytest.mark.asyncio
+    async def test_summarize_chunk_rejects_list_response(self):
+        """Test that _summarize_chunk raises ValueError when LLM returns a list instead of string."""
+        import backend.blocks.llm as llm
+
+        block = llm.AITextSummarizerBlock()
+
+        # Mock llm_call to return a list instead of a string
+        async def mock_llm_call(input_data, credentials):
+            # Simulate LLM returning a list when it should return a string
+            return {"summary": ["bullet point 1", "bullet point 2", "bullet point 3"]}
+
+        block.llm_call = mock_llm_call  # type: ignore
+
+        # Create input data
+        input_data = llm.AITextSummarizerBlock.Input(
+            text="Some text to summarize",
+            model=llm.LlmModel.GPT4O,
+            credentials=llm.TEST_CREDENTIALS_INPUT,  # type: ignore
+            style=llm.SummaryStyle.BULLET_POINTS,
+        )
+
+        # Should raise ValueError with descriptive message
+        with pytest.raises(ValueError) as exc_info:
+            await block._summarize_chunk(
+                "Some text to summarize",
+                input_data,
+                credentials=llm.TEST_CREDENTIALS,
+            )
+
+        error_message = str(exc_info.value)
+        assert "Expected a string summary" in error_message
+        assert "received list" in error_message
+        assert "incorrectly formatted" in error_message
+
+    @pytest.mark.asyncio
+    async def test_combine_summaries_rejects_list_response(self):
+        """Test that _combine_summaries raises ValueError when LLM returns a list instead of string."""
+        import backend.blocks.llm as llm
+
+        block = llm.AITextSummarizerBlock()
+
+        # Mock llm_call to return a list instead of a string
+        async def mock_llm_call(input_data, credentials):
+            # Check if this is the final summary call
+            if "final_summary" in input_data.expected_format:
+                # Simulate LLM returning a list when it should return a string
+                return {
+                    "final_summary": [
+                        "bullet point 1",
+                        "bullet point 2",
+                        "bullet point 3",
+                    ]
+                }
+            else:
+                return {"summary": "Valid summary"}
+
+        block.llm_call = mock_llm_call  # type: ignore
+
+        # Create input data
+        input_data = llm.AITextSummarizerBlock.Input(
+            text="Some text to summarize",
+            model=llm.LlmModel.GPT4O,
+            credentials=llm.TEST_CREDENTIALS_INPUT,  # type: ignore
+            style=llm.SummaryStyle.BULLET_POINTS,
+            max_tokens=1000,
+        )
+
+        # Should raise ValueError with descriptive message
+        with pytest.raises(ValueError) as exc_info:
+            await block._combine_summaries(
+                ["summary 1", "summary 2"],
+                input_data,
+                credentials=llm.TEST_CREDENTIALS,
+            )
+
+        error_message = str(exc_info.value)
+        assert "Expected a string final summary" in error_message
+        assert "received list" in error_message
+        assert "incorrectly formatted" in error_message
+
+    @pytest.mark.asyncio
+    async def test_summarize_chunk_accepts_valid_string_response(self):
+        """Test that _summarize_chunk accepts valid string responses."""
+        import backend.blocks.llm as llm
+
+        block = llm.AITextSummarizerBlock()
+
+        # Mock llm_call to return a valid string
+        async def mock_llm_call(input_data, credentials):
+            return {"summary": "This is a valid string summary"}
+
+        block.llm_call = mock_llm_call  # type: ignore
+
+        # Create input data
+        input_data = llm.AITextSummarizerBlock.Input(
+            text="Some text to summarize",
+            model=llm.LlmModel.GPT4O,
+            credentials=llm.TEST_CREDENTIALS_INPUT,  # type: ignore
+        )
+
+        # Should not raise any error
+        result = await block._summarize_chunk(
+            "Some text to summarize",
+            input_data,
+            credentials=llm.TEST_CREDENTIALS,
+        )
+
+        assert result == "This is a valid string summary"
+        assert isinstance(result, str)
+
+    @pytest.mark.asyncio
+    async def test_combine_summaries_accepts_valid_string_response(self):
+        """Test that _combine_summaries accepts valid string responses."""
+        import backend.blocks.llm as llm
+
+        block = llm.AITextSummarizerBlock()
+
+        # Mock llm_call to return a valid string
+        async def mock_llm_call(input_data, credentials):
+            return {"final_summary": "This is a valid final summary string"}
+
+        block.llm_call = mock_llm_call  # type: ignore
+
+        # Create input data
+        input_data = llm.AITextSummarizerBlock.Input(
+            text="Some text to summarize",
+            model=llm.LlmModel.GPT4O,
+            credentials=llm.TEST_CREDENTIALS_INPUT,  # type: ignore
+            max_tokens=1000,
+        )
+
+        # Should not raise any error
+        result = await block._combine_summaries(
+            ["summary 1", "summary 2"],
+            input_data,
+            credentials=llm.TEST_CREDENTIALS,
+        )
+
+        assert result == "This is a valid final summary string"
+        assert isinstance(result, str)
+
+    @pytest.mark.asyncio
+    async def test_summarize_chunk_rejects_dict_response(self):
+        """Test that _summarize_chunk raises ValueError when LLM returns a dict instead of string."""
+        import backend.blocks.llm as llm
+
+        block = llm.AITextSummarizerBlock()
+
+        # Mock llm_call to return a dict instead of a string
+        async def mock_llm_call(input_data, credentials):
+            return {"summary": {"nested": "object", "with": "data"}}
+
+        block.llm_call = mock_llm_call  # type: ignore
+
+        # Create input data
+        input_data = llm.AITextSummarizerBlock.Input(
+            text="Some text to summarize",
+            model=llm.LlmModel.GPT4O,
+            credentials=llm.TEST_CREDENTIALS_INPUT,  # type: ignore
+        )
+
+        # Should raise ValueError
+        with pytest.raises(ValueError) as exc_info:
+            await block._summarize_chunk(
+                "Some text to summarize",
+                input_data,
+                credentials=llm.TEST_CREDENTIALS,
+            )
+
+        error_message = str(exc_info.value)
+        assert "Expected a string summary" in error_message
+        assert "received dict" in error_message

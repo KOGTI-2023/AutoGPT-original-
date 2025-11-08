@@ -15,6 +15,17 @@ from backend.util.data import get_data_path
 
 T = TypeVar("T", bound=BaseSettings)
 
+_SERVICE_NAME = "MainProcess"
+
+
+def get_service_name():
+    return _SERVICE_NAME
+
+
+def set_service_name(name: str):
+    global _SERVICE_NAME
+    _SERVICE_NAME = name
+
 
 class AppEnvironment(str, Enum):
     LOCAL = "local"
@@ -59,6 +70,24 @@ class Config(UpdateTrackingModel["Config"], BaseSettings):
         le=1000,
         description="Maximum number of workers to use for graph execution.",
     )
+
+    requeue_by_republishing: bool = Field(
+        default=True,
+        description="Send rate-limited messages to back of queue by republishing instead of front requeue to prevent blocking other users.",
+    )
+
+    # FastAPI Thread Pool Configuration
+    # IMPORTANT: FastAPI automatically offloads ALL sync functions to a thread pool:
+    # - Sync endpoint functions (def instead of async def)
+    # - Sync dependency functions (def instead of async def)
+    # - Manually called run_in_threadpool() operations
+    # Default thread pool size is only 40, which becomes a bottleneck under high concurrency
+    fastapi_thread_pool_size: int = Field(
+        default=60,
+        ge=40,
+        le=500,
+        description="Thread pool size for FastAPI sync operations. All sync endpoints and dependencies automatically use this pool. Higher values support more concurrent sync operations but use more memory.",
+    )
     pyro_host: str = Field(
         default="localhost",
         description="The default hostname of the Pyro server.",
@@ -68,8 +97,12 @@ class Config(UpdateTrackingModel["Config"], BaseSettings):
         description="The default timeout in seconds, for Pyro client connections.",
     )
     pyro_client_comm_retry: int = Field(
-        default=5,
+        default=100,
         description="The default number of retries for Pyro client connections.",
+    )
+    pyro_client_max_wait: float = Field(
+        default=30.0,
+        description="The maximum wait time in seconds for Pyro client retries.",
     )
     rpc_client_call_timeout: int = Field(
         default=300,
@@ -123,9 +156,19 @@ class Config(UpdateTrackingModel["Config"], BaseSettings):
         default=5 * 60,
         description="Time in seconds after which the execution stuck on QUEUED status is considered late.",
     )
+    cluster_lock_timeout: int = Field(
+        default=300,
+        description="Cluster lock timeout in seconds for graph execution coordination.",
+    )
     execution_late_notification_checkrange_secs: int = Field(
         default=60 * 60,
         description="Time in seconds for how far back to check for the late executions.",
+    )
+    max_concurrent_graph_executions_per_user: int = Field(
+        default=25,
+        ge=1,
+        le=1000,
+        description="Maximum number of concurrent graph executions allowed per user per graph.",
     )
 
     block_error_rate_threshold: float = Field(
@@ -227,6 +270,7 @@ class Config(UpdateTrackingModel["Config"], BaseSettings):
         default="localhost",
         description="The host for the RabbitMQ server",
     )
+
     rabbitmq_port: int = Field(
         default=5672,
         description="The port for the RabbitMQ server",
@@ -235,6 +279,21 @@ class Config(UpdateTrackingModel["Config"], BaseSettings):
     rabbitmq_vhost: str = Field(
         default="/",
         description="The vhost for the RabbitMQ server",
+    )
+
+    redis_host: str = Field(
+        default="localhost",
+        description="The host for the Redis server",
+    )
+
+    redis_port: int = Field(
+        default=6379,
+        description="The port for the Redis server",
+    )
+
+    redis_password: str = Field(
+        default="",
+        description="The password for the Redis server (empty string if no password)",
     )
 
     postmark_sender_email: str = Field(
@@ -479,6 +538,9 @@ class Secrets(UpdateTrackingModel["Secrets"], BaseSettings):
     )
 
     openai_api_key: str = Field(default="", description="OpenAI API key")
+    openai_internal_api_key: str = Field(
+        default="", description="OpenAI Internal API key"
+    )
     aiml_api_key: str = Field(default="", description="'AI/ML API' key")
     anthropic_api_key: str = Field(default="", description="Anthropic API key")
     groq_api_key: str = Field(default="", description="Groq API key")

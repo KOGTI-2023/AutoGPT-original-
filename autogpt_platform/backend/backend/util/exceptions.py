@@ -1,3 +1,6 @@
+from typing import Mapping
+
+
 class MissingConfigError(Exception):
     """The attempted operation requires configuration which is not available"""
 
@@ -12,6 +15,14 @@ class NeedConfirmation(Exception):
 
 class NotAuthorizedError(ValueError):
     """The user is not authorized to perform the requested operation"""
+
+
+class GraphNotAccessibleError(NotAuthorizedError):
+    """Raised when attempting to execute a graph that is not accessible to the user."""
+
+
+class GraphNotInLibraryError(GraphNotAccessibleError):
+    """Raised when attempting to execute a graph that is not / no longer in the user's library."""
 
 
 class InsufficientBalanceError(ValueError):
@@ -69,7 +80,7 @@ class GraphValidationError(ValueError):
     """Structured validation error for graph validation failures"""
 
     def __init__(
-        self, message: str, node_errors: dict[str, dict[str, str]] | None = None
+        self, message: str, node_errors: Mapping[str, Mapping[str, str]] | None = None
     ):
         super().__init__(message)
         self.message = message
@@ -83,3 +94,15 @@ class GraphValidationError(ValueError):
                 for node_id, errors in self.node_errors.items()
             ]
         )
+
+
+class DatabaseError(Exception):
+    """Raised when there is an error interacting with the database"""
+
+    pass
+
+
+class RedisError(Exception):
+    """Raised when there is an error interacting with Redis"""
+
+    pass

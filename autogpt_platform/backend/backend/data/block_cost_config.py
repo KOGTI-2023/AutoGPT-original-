@@ -1,7 +1,11 @@
 from typing import Type
 
 from backend.blocks.ai_music_generator import AIMusicGeneratorBlock
-from backend.blocks.ai_shortform_video_block import AIShortformVideoCreatorBlock
+from backend.blocks.ai_shortform_video_block import (
+    AIAdMakerVideoCreatorBlock,
+    AIScreenshotToVideoAdBlock,
+    AIShortformVideoCreatorBlock,
+)
 from backend.blocks.apollo.organization import SearchOrganizationsBlock
 from backend.blocks.apollo.people import SearchPeopleBlock
 from backend.blocks.apollo.person import GetPersonDetailBlock
@@ -29,8 +33,7 @@ from backend.blocks.replicate.replicate_block import ReplicateModelBlock
 from backend.blocks.smart_decision_maker import SmartDecisionMakerBlock
 from backend.blocks.talking_head import CreateTalkingAvatarVideoBlock
 from backend.blocks.text_to_speech_block import UnrealTextToSpeechBlock
-from backend.data.block import Block
-from backend.data.cost import BlockCost, BlockCostType
+from backend.data.block import Block, BlockCost, BlockCostType
 from backend.integrations.credentials_store import (
     aiml_api_credentials,
     anthropic_credentials,
@@ -70,29 +73,24 @@ MODEL_COST: dict[LlmModel, int] = {
     LlmModel.CLAUDE_4_1_OPUS: 21,
     LlmModel.CLAUDE_4_OPUS: 21,
     LlmModel.CLAUDE_4_SONNET: 5,
+    LlmModel.CLAUDE_4_5_HAIKU: 4,
+    LlmModel.CLAUDE_4_5_SONNET: 9,
     LlmModel.CLAUDE_3_7_SONNET: 5,
-    LlmModel.CLAUDE_3_5_SONNET: 4,
-    LlmModel.CLAUDE_3_5_HAIKU: 1,  # $0.80 / $4.00
     LlmModel.CLAUDE_3_HAIKU: 1,
     LlmModel.AIML_API_QWEN2_5_72B: 1,
     LlmModel.AIML_API_LLAMA3_1_70B: 1,
     LlmModel.AIML_API_LLAMA3_3_70B: 1,
     LlmModel.AIML_API_META_LLAMA_3_1_70B: 1,
     LlmModel.AIML_API_LLAMA_3_2_3B: 1,
-    LlmModel.LLAMA3_8B: 1,
-    LlmModel.LLAMA3_70B: 1,
-    LlmModel.GEMMA2_9B: 1,
     LlmModel.LLAMA3_3_70B: 1,  # $0.59 / $0.79
     LlmModel.LLAMA3_1_8B: 1,
     LlmModel.OLLAMA_LLAMA3_3: 1,
     LlmModel.OLLAMA_LLAMA3_2: 1,
     LlmModel.OLLAMA_LLAMA3_8B: 1,
     LlmModel.OLLAMA_LLAMA3_405B: 1,
-    LlmModel.DEEPSEEK_LLAMA_70B: 1,  # ? / ?
     LlmModel.OLLAMA_DOLPHIN: 1,
     LlmModel.OPENAI_GPT_OSS_120B: 1,
     LlmModel.OPENAI_GPT_OSS_20B: 1,
-    LlmModel.GEMINI_FLASH_1_5: 1,
     LlmModel.GEMINI_2_5_PRO: 4,
     LlmModel.MISTRAL_NEMO: 1,
     LlmModel.COHERE_COMMAND_R_08_2024: 1,
@@ -322,7 +320,31 @@ BLOCK_COSTS: dict[Type[Block], list[BlockCost]] = {
     ],
     AIShortformVideoCreatorBlock: [
         BlockCost(
-            cost_amount=50,
+            cost_amount=307,
+            cost_filter={
+                "credentials": {
+                    "id": revid_credentials.id,
+                    "provider": revid_credentials.provider,
+                    "type": revid_credentials.type,
+                }
+            },
+        )
+    ],
+    AIAdMakerVideoCreatorBlock: [
+        BlockCost(
+            cost_amount=714,
+            cost_filter={
+                "credentials": {
+                    "id": revid_credentials.id,
+                    "provider": revid_credentials.provider,
+                    "type": revid_credentials.type,
+                }
+            },
+        )
+    ],
+    AIScreenshotToVideoAdBlock: [
+        BlockCost(
+            cost_amount=612,
             cost_filter={
                 "credentials": {
                     "id": revid_credentials.id,
