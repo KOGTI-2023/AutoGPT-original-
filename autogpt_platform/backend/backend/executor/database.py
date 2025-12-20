@@ -3,12 +3,17 @@ from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Callable, Concatenate, ParamSpec, TypeVar, cast
 
 from backend.data import db
+from backend.data.analytics import (
+    get_accuracy_trends_and_alerts,
+    get_marketplace_graphs_for_monitoring,
+)
 from backend.data.credit import UsageTransactionMetadata, get_user_credit_model
 from backend.data.execution import (
     create_graph_execution,
     get_block_error_stats,
     get_child_graph_executions,
     get_execution_kv_data,
+    get_frequently_executed_graphs,
     get_graph_execution_meta,
     get_graph_executions,
     get_graph_executions_count,
@@ -28,8 +33,14 @@ from backend.data.graph import (
     get_connected_output_nodes,
     get_graph,
     get_graph_metadata,
+    get_graph_settings,
     get_node,
     validate_graph_execution_permissions,
+)
+from backend.data.human_review import (
+    get_or_create_human_review,
+    has_pending_reviews_for_graph_exec,
+    update_review_processed_status,
 )
 from backend.data.notifications import (
     clear_all_user_notification_batches,
@@ -139,12 +150,16 @@ class DatabaseManager(AppService):
     get_execution_kv_data = _(get_execution_kv_data)
     set_execution_kv_data = _(set_execution_kv_data)
     get_block_error_stats = _(get_block_error_stats)
+    get_accuracy_trends_and_alerts = _(get_accuracy_trends_and_alerts)
+    get_frequently_executed_graphs = _(get_frequently_executed_graphs)
+    get_marketplace_graphs_for_monitoring = _(get_marketplace_graphs_for_monitoring)
 
     # Graphs
     get_node = _(get_node)
     get_graph = _(get_graph)
     get_connected_output_nodes = _(get_connected_output_nodes)
     get_graph_metadata = _(get_graph_metadata)
+    get_graph_settings = _(get_graph_settings)
 
     # Credits
     spend_credits = _(_spend_credits, name="spend_credits")
@@ -160,6 +175,11 @@ class DatabaseManager(AppService):
     get_user_email_by_id = _(get_user_email_by_id)
     get_user_email_verification = _(get_user_email_verification)
     get_user_notification_preference = _(get_user_notification_preference)
+
+    # Human In The Loop
+    get_or_create_human_review = _(get_or_create_human_review)
+    has_pending_reviews_for_graph_exec = _(has_pending_reviews_for_graph_exec)
+    update_review_processed_status = _(update_review_processed_status)
 
     # Notifications - async
     clear_all_user_notification_batches = _(clear_all_user_notification_batches)
@@ -214,6 +234,13 @@ class DatabaseManagerClient(AppServiceClient):
 
     # Block error monitoring
     get_block_error_stats = _(d.get_block_error_stats)
+    # Execution accuracy monitoring
+    get_accuracy_trends_and_alerts = _(d.get_accuracy_trends_and_alerts)
+    get_frequently_executed_graphs = _(d.get_frequently_executed_graphs)
+    get_marketplace_graphs_for_monitoring = _(d.get_marketplace_graphs_for_monitoring)
+
+    # Human In The Loop
+    has_pending_reviews_for_graph_exec = _(d.has_pending_reviews_for_graph_exec)
 
     # User Emails
     get_user_email_by_id = _(d.get_user_email_by_id)
@@ -241,6 +268,7 @@ class DatabaseManagerAsyncClient(AppServiceClient):
     get_latest_node_execution = d.get_latest_node_execution
     get_graph = d.get_graph
     get_graph_metadata = d.get_graph_metadata
+    get_graph_settings = d.get_graph_settings
     get_graph_execution_meta = d.get_graph_execution_meta
     get_node = d.get_node
     get_node_execution = d.get_node_execution
@@ -255,6 +283,10 @@ class DatabaseManagerAsyncClient(AppServiceClient):
     update_user_integrations = d.update_user_integrations
     get_execution_kv_data = d.get_execution_kv_data
     set_execution_kv_data = d.set_execution_kv_data
+
+    # Human In The Loop
+    get_or_create_human_review = d.get_or_create_human_review
+    update_review_processed_status = d.update_review_processed_status
 
     # User Comms
     get_active_user_ids_in_timerange = d.get_active_user_ids_in_timerange

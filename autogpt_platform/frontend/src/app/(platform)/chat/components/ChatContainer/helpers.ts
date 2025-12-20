@@ -145,6 +145,7 @@ export function parseToolResponse(
       if (isAgentArray(agentsData)) {
         return {
           type: "agent_carousel",
+          toolName: "agent_carousel",
           agents: agentsData,
           totalCount: parsedResult.total_count as number | undefined,
           timestamp: timestamp || new Date(),
@@ -156,15 +157,18 @@ export function parseToolResponse(
     if (responseType === "execution_started") {
       return {
         type: "execution_started",
+        toolName: "execution_started",
         executionId: (parsedResult.execution_id as string) || "",
-        agentName: parsedResult.agent_name as string | undefined,
+        agentName: (parsedResult.graph_name as string) || undefined,
         message: parsedResult.message as string | undefined,
+        libraryAgentLink: parsedResult.library_agent_link as string | undefined,
         timestamp: timestamp || new Date(),
       };
     }
     if (responseType === "need_login") {
       return {
         type: "login_needed",
+        toolName: "login_needed",
         message:
           (parsedResult.message as string) ||
           "Please sign in to use chat and agent features",
@@ -260,6 +264,7 @@ export function extractCredentialsNeeded(
       }));
       return {
         type: "credentials_needed",
+        toolName: "run_agent",
         credentials,
         message: `To run ${agentName}, you need to add ${credentials.length === 1 ? "credentials" : `${credentials.length} credentials`}.`,
         agentName,

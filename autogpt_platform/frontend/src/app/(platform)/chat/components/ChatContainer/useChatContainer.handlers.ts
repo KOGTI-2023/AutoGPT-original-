@@ -100,9 +100,9 @@ export function handleToolResponse(
       parsedResult = null;
     }
     if (
-      chunk.tool_name === "get_required_setup_info" &&
+      chunk.tool_name === "run_agent" &&
       chunk.success &&
-      parsedResult
+      parsedResult?.type === "setup_requirements"
     ) {
       const credentialsMessage = extractCredentialsNeeded(parsedResult);
       if (credentialsMessage) {
@@ -141,6 +141,7 @@ export function handleLoginNeeded(
 ) {
   const loginNeededMessage: ChatMessageData = {
     type: "login_needed",
+    toolName: "login_needed",
     message: chunk.message || "Please sign in to use chat and agent features",
     sessionId: chunk.session_id || deps.sessionId,
     agentInfo: chunk.agent_info,
