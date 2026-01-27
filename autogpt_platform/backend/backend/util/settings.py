@@ -264,7 +264,7 @@ class Config(UpdateTrackingModel["Config"], BaseSettings):
     )
 
     reddit_user_agent: str = Field(
-        default="AutoGPT:1.0 (by /u/autogpt)",
+        default="web:AutoGPT:v0.6.0 (by /u/autogpt)",
         description="The user agent for the Reddit API",
     )
 
@@ -360,6 +360,13 @@ class Config(UpdateTrackingModel["Config"], BaseSettings):
         ge=1,
         le=24,
         description="Hours between cloud storage cleanup runs (1-24 hours)",
+    )
+
+    oauth_token_cleanup_interval_hours: int = Field(
+        default=6,
+        ge=1,
+        le=24,
+        description="Hours between OAuth token cleanup runs (1-24 hours)",
     )
 
     upload_file_size_limit_mb: int = Field(
@@ -651,6 +658,14 @@ class Secrets(UpdateTrackingModel["Secrets"], BaseSettings):
 
     ayrshare_api_key: str = Field(default="", description="Ayrshare API Key")
     ayrshare_jwt_key: str = Field(default="", description="Ayrshare private Key")
+
+    # Langfuse prompt management
+    langfuse_public_key: str = Field(default="", description="Langfuse public key")
+    langfuse_secret_key: str = Field(default="", description="Langfuse secret key")
+    langfuse_host: str = Field(
+        default="https://cloud.langfuse.com", description="Langfuse host URL"
+    )
+
     # Add more secret fields as needed
     model_config = SettingsConfigDict(
         env_file=".env",
