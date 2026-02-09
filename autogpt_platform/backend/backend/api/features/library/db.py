@@ -21,7 +21,7 @@ from backend.data.model import CredentialsMetaInput
 from backend.integrations.creds_manager import IntegrationCredentialsManager
 from backend.integrations.webhooks.graph_lifecycle_hooks import on_graph_activate
 from backend.util.clients import get_scheduler_client
-from backend.util.exceptions import DatabaseError, NotFoundError
+from backend.util.exceptions import DatabaseError, InvalidInputError, NotFoundError
 from backend.util.json import SafeJson
 from backend.util.models import Pagination
 from backend.util.settings import Config
@@ -39,6 +39,7 @@ async def list_library_agents(
     sort_by: library_model.LibraryAgentSort = library_model.LibraryAgentSort.UPDATED_AT,
     page: int = 1,
     page_size: int = 50,
+    include_executions: bool = False,
 ) -> library_model.LibraryAgentResponse:
     """
     Retrieves a paginated list of LibraryAgent records for a given user.
@@ -49,6 +50,9 @@ async def list_library_agents(
         sort_by: Sorting field (createdAt, updatedAt, isFavorite, isCreatedByUser).
         page: Current page (1-indexed).
         page_size: Number of items per page.
+        include_executions: Whether to include execution data for status calculation.
+            Defaults to False for performance (UI fetches status separately).
+            Set to True when accurate status/metrics are needed (e.g., agent generator).
 
     Returns:
         A LibraryAgentResponse containing the list of agents and pagination details.
@@ -64,11 +68,11 @@ async def list_library_agents(
 
     if page < 1 or page_size < 1:
         logger.warning(f"Invalid pagination: page={page}, page_size={page_size}")
-        raise DatabaseError("Invalid pagination input")
+        raise InvalidInputError("Invalid pagination input")
 
     if search_term and len(search_term.strip()) > 100:
         logger.warning(f"Search term too long: {repr(search_term)}")
-        raise DatabaseError("Search term is too long")
+        raise InvalidInputError("Search term is too long")
 
     where_clause: prisma.types.LibraryAgentWhereInput = {
         "userId": user_id,
@@ -76,7 +80,6 @@ async def list_library_agents(
         "isArchived": False,
     }
 
-    # Build search filter if applicable
     if search_term:
         where_clause["OR"] = [
             {
@@ -93,7 +96,6 @@ async def list_library_agents(
             },
         ]
 
-    # Determine sorting
     order_by: prisma.types.LibraryAgentOrderByInput | None = None
 
     if sort_by == library_model.LibraryAgentSort.CREATED_AT:
@@ -105,7 +107,7 @@ async def list_library_agents(
         library_agents = await prisma.models.LibraryAgent.prisma().find_many(
             where=where_clause,
             include=library_agent_include(
-                user_id, include_nodes=False, include_executions=False
+                user_id, include_nodes=False, include_executions=include_executions
             ),
             order=order_by,
             skip=(page - 1) * page_size,
@@ -175,7 +177,7 @@ async def list_favorite_library_agents(
 
     if page < 1 or page_size < 1:
         logger.warning(f"Invalid pagination: page={page}, page_size={page_size}")
-        raise DatabaseError("Invalid pagination input")
+        raise InvalidInputError("Invalid pagination input")
 
     where_clause: prisma.types.LibraryAgentWhereInput = {
         "userId": user_id,
@@ -583,7 +585,13 @@ async def update_library_agent(
             )
         update_fields["isDeleted"] = is_deleted
     if settings is not None:
-        update_fields["settings"] = SafeJson(settings.model_dump())
+        existing_agent = await get_library_agent(id=library_agent_id, user_id=user_id)
+        current_settings_dict = (
+            existing_agent.settings.model_dump() if existing_agent.settings else {}
+        )
+        new_settings = settings.model_dump(exclude_unset=True)
+        merged_settings = {**current_settings_dict, **new_settings}
+        update_fields["settings"] = SafeJson(merged_settings)
 
     try:
         # If graph_version is provided, update to that specific version
