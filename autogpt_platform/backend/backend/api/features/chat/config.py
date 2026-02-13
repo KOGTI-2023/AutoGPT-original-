@@ -11,7 +11,7 @@ class ChatConfig(BaseSettings):
 
     # OpenAI API Configuration
     model: str = Field(
-        default="anthropic/claude-opus-4.5", description="Default model to use"
+        default="anthropic/claude-opus-4.6", description="Default model to use"
     )
     title_model: str = Field(
         default="openai/gpt-4o-mini",
@@ -91,6 +91,12 @@ class ChatConfig(BaseSettings):
     langfuse_prompt_name: str = Field(
         default="CoPilot Prompt",
         description="Name of the prompt in Langfuse to fetch",
+    )
+
+    # Extended thinking configuration for Claude models
+    thinking_enabled: bool = Field(
+        default=True,
+        description="Enable adaptive thinking for Claude models via OpenRouter",
     )
 
     @field_validator("api_key", mode="before")
