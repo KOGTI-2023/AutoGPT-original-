@@ -40,10 +40,11 @@ from backend.api.model import (
     UpdateTimezoneRequest,
     UploadFileResponse,
 )
+from backend.blocks import get_block, get_blocks
 from backend.data import execution as execution_db
 from backend.data import graph as graph_db
 from backend.data.auth import api_key as api_key_db
-from backend.data.block import BlockInput, CompletedBlockOutput, get_block, get_blocks
+from backend.data.block import BlockInput, CompletedBlockOutput
 from backend.data.credit import (
     AutoTopUpConfig,
     RefundRequest,
@@ -125,6 +126,9 @@ v1_router = APIRouter()
 ########################################################
 
 
+_tally_background_tasks: set[asyncio.Task] = set()
+
+
 @v1_router.post(
     "/auth/user",
     summary="Get or create user",
@@ -133,6 +137,24 @@ v1_router = APIRouter()
 )
 async def get_or_create_user_route(user_data: dict = Security(get_jwt_payload)):
     user = await get_or_create_user(user_data)
+
+    # Fire-and-forget: populate business understanding from Tally form.
+    # We use created_at proximity instead of an is_new flag because
+    # get_or_create_user is cached — a separate is_new return value would be
+    # unreliable on repeated calls within the cache TTL.
+    age_seconds = (datetime.now(timezone.utc) - user.created_at).total_seconds()
+    if age_seconds < 30:
+        try:
+            from backend.data.tally import populate_understanding_from_tally
+
+            task = asyncio.create_task(
+                populate_understanding_from_tally(user.id, user.email)
+            )
+            _tally_background_tasks.add(task)
+            task.add_done_callback(_tally_background_tasks.discard)
+        except Exception:
+            logger.debug("Failed to start Tally population task", exc_info=True)
+
     return user.model_dump()
 
 
@@ -427,7 +449,6 @@ async def execute_graph_block(
 async def upload_file(
     user_id: Annotated[str, Security(get_user_id)],
     file: UploadFile = File(...),
-    provider: str = "gcs",
     expiration_hours: int = 24,
 ) -> UploadFileResponse:
     """
@@ -490,7 +511,6 @@ async def upload_file(
     storage_path = await cloud_storage.store_file(
         content=content,
         filename=file_name,
-        provider=provider,
         expiration_hours=expiration_hours,
         user_id=user_id,
     )
@@ -572,6 +592,11 @@ async def fulfill_checkout(user_id: Annotated[str, Security(get_user_id)]):
 async def configure_user_auto_top_up(
     request: AutoTopUpConfig, user_id: Annotated[str, Security(get_user_id)]
 ) -> str:
+    """Configure auto top-up settings and perform an immediate top-up if needed.
+
+    Raises HTTPException(422) if the request parameters are invalid or if
+    the credit top-up fails.
+    """
     if request.threshold < 0:
         raise HTTPException(status_code=422, detail="Threshold must be greater than 0")
     if request.amount < 500 and request.amount != 0:
@@ -586,10 +611,20 @@ async def configure_user_auto_top_up(
     user_credit_model = await get_user_credit_model(user_id)
     current_balance = await user_credit_model.get_credits(user_id)
 
-    if current_balance < request.threshold:
-        await user_credit_model.top_up_credits(user_id, request.amount)
-    else:
-        await user_credit_model.top_up_credits(user_id, 0)
+    try:
+        if current_balance < request.threshold:
+            await user_credit_model.top_up_credits(user_id, request.amount)
+        else:
+            await user_credit_model.top_up_credits(user_id, 0)
+    except ValueError as e:
+        known_messages = (
+            "must not be negative",
+            "already exists for user",
+            "No payment method found",
+        )
+        if any(msg in str(e) for msg in known_messages):
+            raise HTTPException(status_code=422, detail=str(e))
+        raise
 
     await set_auto_top_up(
         user_id, AutoTopUpConfig(threshold=request.threshold, amount=request.amount)
@@ -945,14 +980,16 @@ async def execute_graph(
     source: Annotated[GraphExecutionSource | None, Body(embed=True)] = None,
     graph_version: Optional[int] = None,
     preset_id: Optional[str] = None,
+    dry_run: Annotated[bool, Body(embed=True)] = False,
 ) -> execution_db.GraphExecutionMeta:
-    user_credit_model = await get_user_credit_model(user_id)
-    current_balance = await user_credit_model.get_credits(user_id)
-    if current_balance <= 0:
-        raise HTTPException(
-            status_code=402,
-            detail="Insufficient balance to execute the agent. Please top up your account.",
-        )
+    if not dry_run:
+        user_credit_model = await get_user_credit_model(user_id)
+        current_balance = await user_credit_model.get_credits(user_id)
+        if current_balance <= 0:
+            raise HTTPException(
+                status_code=402,
+                detail="Insufficient balance to execute the agent. Please top up your account.",
+            )
 
     try:
         result = await execution_utils.add_graph_execution(
@@ -962,6 +999,7 @@ async def execute_graph(
             preset_id=preset_id,
             graph_version=graph_version,
             graph_credentials_inputs=credentials_inputs,
+            dry_run=dry_run,
         )
         # Record successful graph execution
         record_graph_execution(graph_id=graph_id, status="success", user_id=user_id)

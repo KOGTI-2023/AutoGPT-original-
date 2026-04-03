@@ -1,7 +1,7 @@
 import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import TYPE_CHECKING, Annotated, List, Literal
+from typing import TYPE_CHECKING, Annotated, Any, List, Literal
 
 from autogpt_libs.auth import get_user_id
 from fastapi import (
@@ -14,7 +14,7 @@ from fastapi import (
     Security,
     status,
 )
-from pydantic import BaseModel, Field, SecretStr
+from pydantic import BaseModel, Field, SecretStr, model_validator
 from starlette.status import HTTP_500_INTERNAL_SERVER_ERROR, HTTP_502_BAD_GATEWAY
 
 from backend.api.features.library.db import set_preset_webhook, update_preset
@@ -34,12 +34,17 @@ from backend.data.model import (
     HostScopedCredentials,
     OAuth2Credentials,
     UserIntegrations,
+    is_sdk_default,
 )
 from backend.data.onboarding import OnboardingStep, complete_onboarding_step
 from backend.data.user import get_user_integrations
 from backend.executor.utils import add_graph_execution
 from backend.integrations.ayrshare import AyrshareClient, SocialPlatform
-from backend.integrations.creds_manager import IntegrationCredentialsManager
+from backend.integrations.credentials_store import provider_matches
+from backend.integrations.creds_manager import (
+    IntegrationCredentialsManager,
+    create_mcp_oauth_handler,
+)
 from backend.integrations.oauth import CREDENTIALS_BY_PROVIDER, HANDLERS_BY_NAME
 from backend.integrations.providers import ProviderName
 from backend.integrations.webhooks import get_webhook_manager
@@ -102,7 +107,47 @@ class CredentialsMetaResponse(BaseModel):
     scopes: list[str] | None
     username: str | None
     host: str | None = Field(
-        default=None, description="Host pattern for host-scoped credentials"
+        default=None,
+        description="Host pattern for host-scoped or MCP server URL for MCP credentials",
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_provider(cls, data: Any) -> Any:
+        """Fix ``ProviderName.X`` format from Python 3.13 ``str(Enum)`` bug."""
+        if isinstance(data, dict):
+            prov = data.get("provider", "")
+            if isinstance(prov, str) and prov.startswith("ProviderName."):
+                member = prov.removeprefix("ProviderName.")
+                try:
+                    data = {**data, "provider": ProviderName[member].value}
+                except KeyError:
+                    pass
+        return data
+
+    @staticmethod
+    def get_host(cred: Credentials) -> str | None:
+        """Extract host from credential: HostScoped host or MCP server URL."""
+        if isinstance(cred, HostScopedCredentials):
+            return cred.host
+        if isinstance(cred, OAuth2Credentials) and cred.provider in (
+            ProviderName.MCP,
+            ProviderName.MCP.value,
+            "ProviderName.MCP",
+        ):
+            return (cred.metadata or {}).get("mcp_server_url")
+        return None
+
+
+def to_meta_response(cred: Credentials) -> CredentialsMetaResponse:
+    return CredentialsMetaResponse(
+        id=cred.id,
+        provider=cred.provider,
+        type=cred.type,
+        title=cred.title,
+        scopes=cred.scopes if isinstance(cred, OAuth2Credentials) else None,
+        username=cred.username if isinstance(cred, OAuth2Credentials) else None,
+        host=CredentialsMetaResponse.get_host(cred),
     )
 
 
@@ -172,17 +217,7 @@ async def callback(
         f"and provider {provider.value}"
     )
 
-    return CredentialsMetaResponse(
-        id=credentials.id,
-        provider=credentials.provider,
-        type=credentials.type,
-        title=credentials.title,
-        scopes=credentials.scopes,
-        username=credentials.username,
-        host=(
-            credentials.host if isinstance(credentials, HostScopedCredentials) else None
-        ),
-    )
+    return to_meta_response(credentials)
 
 
 @router.get("/credentials", summary="List Credentials")
@@ -192,16 +227,7 @@ async def list_credentials(
     credentials = await creds_manager.store.get_all_creds(user_id)
 
     return [
-        CredentialsMetaResponse(
-            id=cred.id,
-            provider=cred.provider,
-            type=cred.type,
-            title=cred.title,
-            scopes=cred.scopes if isinstance(cred, OAuth2Credentials) else None,
-            username=cred.username if isinstance(cred, OAuth2Credentials) else None,
-            host=cred.host if isinstance(cred, HostScopedCredentials) else None,
-        )
-        for cred in credentials
+        to_meta_response(cred) for cred in credentials if not is_sdk_default(cred.id)
     ]
 
 
@@ -215,16 +241,7 @@ async def list_credentials_by_provider(
     credentials = await creds_manager.store.get_creds_by_provider(user_id, provider)
 
     return [
-        CredentialsMetaResponse(
-            id=cred.id,
-            provider=cred.provider,
-            type=cred.type,
-            title=cred.title,
-            scopes=cred.scopes if isinstance(cred, OAuth2Credentials) else None,
-            username=cred.username if isinstance(cred, OAuth2Credentials) else None,
-            host=cred.host if isinstance(cred, HostScopedCredentials) else None,
-        )
-        for cred in credentials
+        to_meta_response(cred) for cred in credentials if not is_sdk_default(cred.id)
     ]
 
 
@@ -237,18 +254,21 @@ async def get_credential(
     ],
     cred_id: Annotated[str, Path(title="The ID of the credentials to retrieve")],
     user_id: Annotated[str, Security(get_user_id)],
-) -> Credentials:
+) -> CredentialsMetaResponse:
+    if is_sdk_default(cred_id):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Credentials not found"
+        )
     credential = await creds_manager.get(user_id, cred_id)
     if not credential:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Credentials not found"
         )
-    if credential.provider != provider:
+    if not provider_matches(credential.provider, provider):
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Credentials do not match the specified provider",
+            status_code=status.HTTP_404_NOT_FOUND, detail="Credentials not found"
         )
-    return credential
+    return to_meta_response(credential)
 
 
 @router.post("/{provider}/credentials", status_code=201, summary="Create Credentials")
@@ -258,16 +278,22 @@ async def create_credentials(
         ProviderName, Path(title="The provider to create credentials for")
     ],
     credentials: Credentials,
-) -> Credentials:
+) -> CredentialsMetaResponse:
+    if is_sdk_default(credentials.id):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Cannot create credentials with a reserved ID",
+        )
     credentials.provider = provider
     try:
         await creds_manager.create(user_id, credentials)
-    except Exception as e:
+    except Exception:
+        logger.exception("Failed to store credentials")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to store credentials: {str(e)}",
+            detail="Failed to store credentials",
         )
-    return credentials
+    return to_meta_response(credentials)
 
 
 class CredentialsDeletionResponse(BaseModel):
@@ -302,15 +328,19 @@ async def delete_credentials(
         bool, Query(title="Whether to proceed if any linked webhooks are still in use")
     ] = False,
 ) -> CredentialsDeletionResponse | CredentialsDeletionNeedsConfirmationResponse:
+    if is_sdk_default(cred_id):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Credentials not found"
+        )
     creds = await creds_manager.store.get_creds_by_id(user_id, cred_id)
     if not creds:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Credentials not found"
         )
-    if creds.provider != provider:
+    if not provider_matches(creds.provider, provider):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="Credentials do not match the specified provider",
+            detail="Credentials not found",
         )
 
     try:
@@ -322,7 +352,11 @@ async def delete_credentials(
 
     tokens_revoked = None
     if isinstance(creds, OAuth2Credentials):
-        handler = _get_provider_oauth_handler(request, provider)
+        if provider_matches(provider.value, ProviderName.MCP.value):
+            # MCP uses dynamic per-server OAuth — create handler from metadata
+            handler = create_mcp_oauth_handler(creds)
+        else:
+            handler = _get_provider_oauth_handler(request, provider)
         tokens_revoked = await handler.revoke_tokens(creds)
 
     return CredentialsDeletionResponse(revoked=tokens_revoked)

@@ -7,6 +7,7 @@ networks:
 volumes:
   supabase-config:
   clamav-data:
+  workspace-data:
 
 x-agpt-services:
   &agpt-services
@@ -52,6 +53,12 @@ services:
     extends:
       file: ./docker-compose.platform.yml
       service: executor
+
+  copilot_executor:
+    <<: *agpt-services
+    extends:
+      file: ./docker-compose.platform.yml
+      service: copilot_executor
 
   websocket_server:
     <<: *agpt-services
@@ -174,5 +181,6 @@ services:
       - deps
       - rest_server
       - executor
+      - copilot_executor
       - websocket_server
       - database_manager

@@ -8,23 +8,19 @@ from typing import Mapping, Optional, cast
 
 from pydantic import BaseModel, JsonValue, ValidationError
 
+from backend.blocks import get_block
+from backend.blocks._base import Block, BlockCostType, BlockType
 from backend.data import execution as execution_db
 from backend.data import graph as graph_db
 from backend.data import human_review as human_review_db
 from backend.data import onboarding as onboarding_db
 from backend.data import user as user_db
-from backend.data.block import (
-    Block,
-    BlockCostType,
-    BlockInput,
-    BlockOutputEntry,
-    BlockType,
-    get_block,
-)
-from backend.data.block_cost_config import BLOCK_COSTS
-from backend.data.db import prisma
+from backend.data import workspace as workspace_db
 
 # Import dynamic field utilities from centralized location
+from backend.data.block import BlockInput, BlockOutputEntry
+from backend.data.block_cost_config import BLOCK_COSTS
+from backend.data.db import prisma
 from backend.data.dynamic_fields import merge_execution_input
 from backend.data.execution import (
     ExecutionContext,
@@ -35,7 +31,7 @@ from backend.data.execution import (
     NodesInputMasks,
 )
 from backend.data.graph import GraphModel, Node
-from backend.data.model import USER_TIMEZONE_NOT_SET, CredentialsMetaInput
+from backend.data.model import USER_TIMEZONE_NOT_SET, CredentialsMetaInput, GraphInput
 from backend.data.rabbitmq import Exchange, ExchangeType, Queue, RabbitMQConfig
 from backend.util.clients import (
     get_async_execution_event_bus,
@@ -50,7 +46,7 @@ from backend.util.exceptions import (
 )
 from backend.util.logging import TruncatedLogger, is_structured_logging_enabled
 from backend.util.settings import Config
-from backend.util.type import convert
+from backend.util.type import coerce_inputs_to_schema
 
 config = Config()
 logger = TruncatedLogger(logging.getLogger(__name__), prefix="[GraphExecutorUtil]")
@@ -185,6 +181,7 @@ def validate_exec(
     node: Node,
     data: BlockInput,
     resolve_input: bool = True,
+    dry_run: bool = False,
 ) -> tuple[BlockInput | None, str]:
     """
     Validate the input data for a node execution.
@@ -193,6 +190,9 @@ def validate_exec(
         node: The node to execute.
         data: The input data for the node execution.
         resolve_input: Whether to resolve dynamic pins into dict/list/object.
+        dry_run: When True, credential fields are allowed to be missing — they
+            will be substituted with a sentinel so the node can be queued and
+            later executed via simulate_block.
 
     Returns:
         A tuple of the validated data and the block name.
@@ -211,27 +211,40 @@ def validate_exec(
     if missing_links := schema.get_missing_links(data, node.input_links):
         return None, f"{error_prefix} unpopulated links {missing_links}"
 
+    # For dry runs, supply sentinel values for any missing credential fields so
+    # the node can be queued — simulate_block never calls the real API anyway.
+    if dry_run:
+        cred_field_names = set(schema.get_credentials_fields().keys())
+        for field_name in cred_field_names:
+            if field_name not in data:
+                data = {**data, field_name: None}
+
     # Merge input data with default values and resolve dynamic dict/list/object pins.
     input_default = schema.get_input_defaults(node.input_default)
     data = {**input_default, **data}
     if resolve_input:
         data = merge_execution_input(data)
 
-    # Convert non-matching data types to the expected input schema.
-    for name, data_type in schema.__annotations__.items():
-        value = data.get(name)
-        if (value is not None) and (type(value) is not data_type):
-            data[name] = convert(value, data_type)
+    # Coerce non-matching data types to the expected input schema.
+    coerce_inputs_to_schema(data, schema)
 
     # Input data post-merge should contain all required fields from the schema.
     if missing_input := schema.get_missing_input(data):
-        return None, f"{error_prefix} missing input {missing_input}"
+        if dry_run:
+            # In dry-run mode all missing inputs are tolerated — simulate_block()
+            # generates synthetic outputs without needing real input values.
+            pass
+        else:
+            return None, f"{error_prefix} missing input {missing_input}"
 
     # Last validation: Validate the input values against the schema.
-    if error := schema.get_mismatch_error(data):
-        error_message = f"{error_prefix} {error}"
-        logger.warning(error_message)
-        return None, error_message
+    # Skip for dry runs — simulate_block doesn't use real inputs, and sentinel
+    # credential values (None) would fail JSON-schema type/required checks.
+    if not dry_run:
+        if error := schema.get_mismatch_error(data):
+            error_message = f"{error_prefix} {error}"
+            logger.warning(error_message)
+            return None, error_message
 
     return data, node_block.name
 
@@ -265,7 +278,13 @@ async def _validate_node_input_credentials(
         # Track if any credential field is missing for this node
         has_missing_credentials = False
 
+        # A credential field is optional if the node metadata says so, or if
+        # the block schema declares a default for the field.
+        required_fields = block.input_schema.get_required_fields()
+        is_creds_optional = node.credentials_optional
+
         for field_name, credentials_meta_type in credentials_fields.items():
+            field_is_optional = is_creds_optional or field_name not in required_fields
             try:
                 # Check nodes_input_masks first, then input_default
                 field_value = None
@@ -278,7 +297,7 @@ async def _validate_node_input_credentials(
                 elif field_name in node.input_default:
                     # For optional credentials, don't use input_default - treat as missing
                     # This prevents stale credential IDs from failing validation
-                    if node.credentials_optional:
+                    if field_is_optional:
                         field_value = None
                     else:
                         field_value = node.input_default[field_name]
@@ -288,8 +307,8 @@ async def _validate_node_input_credentials(
                     isinstance(field_value, dict) and not field_value.get("id")
                 ):
                     has_missing_credentials = True
-                    # If node has credentials_optional flag, mark for skipping instead of error
-                    if node.credentials_optional:
+                    # If credential field is optional, skip instead of error
+                    if field_is_optional:
                         continue  # Don't add error, will be marked for skip after loop
                     else:
                         credential_errors[node.id][
@@ -339,16 +358,16 @@ async def _validate_node_input_credentials(
                 ] = "Invalid credentials: type/provider mismatch"
                 continue
 
-        # If node has optional credentials and any are missing, mark for skipping
-        # But only if there are no other errors for this node
+        # If node has optional credentials and any are missing, allow running without.
+        # The executor will pass credentials=None to the block's run().
         if (
             has_missing_credentials
-            and node.credentials_optional
+            and is_creds_optional
             and node.id not in credential_errors
         ):
-            nodes_to_skip.add(node.id)
             logger.info(
-                f"Node #{node.id} will be skipped: optional credentials not configured"
+                f"Node #{node.id}: optional credentials not configured, "
+                "running without"
             )
 
     return credential_errors, nodes_to_skip
@@ -426,8 +445,9 @@ async def validate_graph_with_credentials(
 async def _construct_starting_node_execution_input(
     graph: GraphModel,
     user_id: str,
-    graph_inputs: BlockInput,
+    graph_inputs: GraphInput,
     nodes_input_masks: Optional[NodesInputMasks] = None,
+    dry_run: bool = False,
 ) -> tuple[list[tuple[str, BlockInput]], set[str]]:
     """
     Validates and prepares the input data for executing a graph.
@@ -438,8 +458,9 @@ async def _construct_starting_node_execution_input(
     Args:
         graph (GraphModel): The graph model to execute.
         user_id (str): The ID of the user executing the graph.
-        data (BlockInput): The input data for the graph execution.
+        data (GraphInput): The input data for the graph execution.
         node_credentials_map: `dict[node_id, dict[input_name, CredentialsMetaInput]]`
+        dry_run: When True, skip credential validation errors (simulation needs no real creds).
 
     Returns:
         tuple[
@@ -452,6 +473,32 @@ async def _construct_starting_node_execution_input(
     validation_errors, nodes_to_skip = await validate_graph_with_credentials(
         graph, user_id, nodes_input_masks
     )
+    # Dry runs simulate every block — missing credentials are irrelevant.
+    # Strip credential-only errors so the graph can proceed.
+    if dry_run and validation_errors:
+
+        def _is_credential_error(msg: str) -> bool:
+            """Match errors produced by _validate_node_input_credentials."""
+            m = msg.lower()
+            return (
+                m == "these credentials are required"
+                or m.startswith("invalid credentials:")
+                or m.startswith("credentials not available:")
+                or m.startswith("unknown credentials #")
+            )
+
+        validation_errors = {
+            node_id: {
+                field: msg
+                for field, msg in errors.items()
+                if not _is_credential_error(msg)
+            }
+            for node_id, errors in validation_errors.items()
+        }
+        # Remove nodes that have no remaining errors
+        validation_errors = {
+            node_id: errors for node_id, errors in validation_errors.items() if errors
+        }
     n_error_nodes = len(validation_errors)
     n_errors = sum(len(errors) for errors in validation_errors.values())
     if validation_errors:
@@ -479,7 +526,23 @@ async def _construct_starting_node_execution_input(
         if nodes_input_masks and (node_input_mask := nodes_input_masks.get(node.id)):
             input_data.update(node_input_mask)
 
-        input_data, error = validate_exec(node, input_data)
+        # Webhook-triggered agents cannot be executed directly without payload data.
+        # Legitimate webhook triggers provide payload via nodes_input_masks above.
+        if (
+            block.block_type
+            in (
+                BlockType.WEBHOOK,
+                BlockType.WEBHOOK_MANUAL,
+            )
+            and "payload" not in input_data
+        ):
+            raise ValueError(
+                "This agent is triggered by an external event (webhook) "
+                "and cannot be executed directly. "
+                "Please use the appropriate trigger to run this agent."
+            )
+
+        input_data, error = validate_exec(node, input_data, dry_run=dry_run)
         if input_data is None:
             raise ValueError(error)
         else:
@@ -496,11 +559,12 @@ async def _construct_starting_node_execution_input(
 async def validate_and_construct_node_execution_input(
     graph_id: str,
     user_id: str,
-    graph_inputs: BlockInput,
+    graph_inputs: GraphInput,
     graph_version: Optional[int] = None,
     graph_credentials_inputs: Optional[Mapping[str, CredentialsMetaInput]] = None,
     nodes_input_masks: Optional[NodesInputMasks] = None,
     is_sub_graph: bool = False,
+    dry_run: bool = False,
 ) -> tuple[GraphModel, list[tuple[str, BlockInput]], NodesInputMasks, set[str]]:
     """
     Public wrapper that handles graph fetching, credential mapping, and validation+construction.
@@ -566,6 +630,7 @@ async def validate_and_construct_node_execution_input(
             user_id=user_id,
             graph_inputs=graph_inputs,
             nodes_input_masks=nodes_input_masks,
+            dry_run=dry_run,
         )
     )
 
@@ -796,13 +861,14 @@ async def stop_graph_execution(
 async def add_graph_execution(
     graph_id: str,
     user_id: str,
-    inputs: Optional[BlockInput] = None,
+    inputs: Optional[GraphInput] = None,
     preset_id: Optional[str] = None,
     graph_version: Optional[int] = None,
     graph_credentials_inputs: Optional[Mapping[str, CredentialsMetaInput]] = None,
     nodes_input_masks: Optional[NodesInputMasks] = None,
     execution_context: Optional[ExecutionContext] = None,
     graph_exec_id: Optional[str] = None,
+    dry_run: bool = False,
 ) -> GraphExecutionWithNodes:
     """
     Adds a graph execution to the queue and returns the execution entry.
@@ -829,8 +895,9 @@ async def add_graph_execution(
         udb = user_db
         gdb = graph_db
         odb = onboarding_db
+        wdb = workspace_db
     else:
-        edb = udb = gdb = odb = get_database_manager_async_client()
+        edb = udb = gdb = odb = wdb = get_database_manager_async_client()
 
     # Get or create the graph execution
     if graph_exec_id:
@@ -866,6 +933,7 @@ async def add_graph_execution(
                 graph_credentials_inputs=graph_credentials_inputs,
                 nodes_input_masks=nodes_input_masks,
                 is_sub_graph=parent_exec_id is not None,
+                dry_run=dry_run,
             )
         )
 
@@ -879,6 +947,7 @@ async def add_graph_execution(
             starting_nodes_input=starting_nodes_input,
             preset_id=preset_id,
             parent_graph_exec_id=parent_exec_id,
+            is_dry_run=dry_run,
         )
 
         logger.info(
@@ -890,6 +959,7 @@ async def add_graph_execution(
     if execution_context is None:
         user = await udb.get_user_by_id(user_id)
         settings = await gdb.get_graph_settings(user_id=user_id, graph_id=graph_id)
+        workspace = await wdb.get_or_create_workspace(user_id)
 
         execution_context = ExecutionContext(
             # Execution identity
@@ -900,12 +970,15 @@ async def add_graph_execution(
             # Safety settings
             human_in_the_loop_safe_mode=settings.human_in_the_loop_safe_mode,
             sensitive_action_safe_mode=settings.sensitive_action_safe_mode,
+            dry_run=dry_run,
             # User settings
             user_timezone=(
                 user.timezone if user.timezone != USER_TIMEZONE_NOT_SET else "UTC"
             ),
             # Execution hierarchy
             root_execution_id=graph_exec.id,
+            # Workspace (enables workspace:// file resolution in blocks)
+            workspace_id=workspace.id,
         )
 
     try:

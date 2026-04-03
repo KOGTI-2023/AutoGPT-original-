@@ -16,16 +16,13 @@ from pika.spec import Basic, BasicProperties
 from prometheus_client import Gauge, start_http_server
 from redis.asyncio.lock import Lock as AsyncRedisLock
 
+from backend.blocks import get_block
+from backend.blocks._base import BlockSchema
 from backend.blocks.agent import AgentExecutorBlock
 from backend.blocks.io import AgentOutputBlock
+from backend.blocks.mcp.block import MCPToolBlock
 from backend.data import redis_client as redis
-from backend.data.block import (
-    BlockInput,
-    BlockOutput,
-    BlockOutputEntry,
-    BlockSchema,
-    get_block,
-)
+from backend.data.block import BlockInput, BlockOutput, BlockOutputEntry
 from backend.data.credit import UsageTransactionMetadata
 from backend.data.dynamic_fields import parse_execution_output
 from backend.data.execution import (
@@ -64,7 +61,12 @@ from backend.util.decorator import (
     error_logged,
     time_measured,
 )
-from backend.util.exceptions import InsufficientBalanceError, ModerationError
+from backend.util.exceptions import (
+    GraphNotFoundError,
+    InsufficientBalanceError,
+    ModerationError,
+    NotFoundError,
+)
 from backend.util.file import clean_exec_files
 from backend.util.logging import TruncatedLogger, configure_logging
 from backend.util.metrics import DiscordChannel
@@ -79,6 +81,7 @@ from backend.util.settings import Settings
 from .activity_status_generator import generate_activity_status_for_execution
 from .automod.manager import automod_manager
 from .cluster_lock import ClusterLock
+from .simulator import simulate_block
 from .utils import (
     GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS,
     GRAPH_EXECUTION_CANCEL_QUEUE_NAME,
@@ -96,7 +99,10 @@ from .utils import (
 )
 
 if TYPE_CHECKING:
-    from backend.executor import DatabaseManagerAsyncClient, DatabaseManagerClient
+    from backend.data.db_manager import (
+        DatabaseManagerAsyncClient,
+        DatabaseManagerClient,
+    )
 
 
 _logger = logging.getLogger(__name__)
@@ -217,9 +223,11 @@ async def execute_node(
         raise ValueError(f"Block {node_block.id} is disabled and cannot be executed")
 
     # Sanity check: validate the execution input.
-    input_data, error = validate_exec(node, data.inputs, resolve_input=False)
+    input_data, error = validate_exec(
+        node, data.inputs, resolve_input=False, dry_run=execution_context.dry_run
+    )
     if input_data is None:
-        log_metadata.error(f"Skip execution, input validation error: {error}")
+        log_metadata.warning(f"Skip execution, input validation error: {error}")
         yield "error", error
         return
 
@@ -232,6 +240,18 @@ async def execute_node(
             _input_data.nodes_input_masks = nodes_input_masks
         _input_data.user_id = user_id
         input_data = _input_data.model_dump()
+    elif isinstance(node_block, MCPToolBlock):
+        _mcp_data = MCPToolBlock.Input(**node.input_default)
+        # Dynamic tool fields are flattened to top-level by validate_exec
+        # (via get_input_defaults). Collect them back into tool_arguments.
+        tool_schema = _mcp_data.tool_input_schema
+        tool_props = set(tool_schema.get("properties", {}).keys())
+        merged_args = {**_mcp_data.tool_arguments}
+        for key in tool_props:
+            if key in input_data:
+                merged_args[key] = input_data[key]
+        _mcp_data.tool_arguments = merged_args
+        input_data = _mcp_data.model_dump()
     data.inputs = input_data
 
     # Execute the node
@@ -268,8 +288,34 @@ async def execute_node(
 
     # Handle regular credentials fields
     for field_name, input_type in input_model.get_credentials_fields().items():
-        credentials_meta = input_type(**input_data[field_name])
-        credentials, lock = await creds_manager.acquire(user_id, credentials_meta.id)
+        field_value = input_data.get(field_name)
+        if not field_value or (
+            isinstance(field_value, dict) and not field_value.get("id")
+        ):
+            # No credentials configured — nullify so JSON schema validation
+            # doesn't choke on the empty default `{}`.
+            input_data[field_name] = None
+            continue  # Block runs without credentials
+
+        credentials_meta = input_type(**field_value)
+        # Write normalized values back so JSON schema validation also passes
+        # (model_validator may have fixed legacy formats like "ProviderName.MCP")
+        input_data[field_name] = credentials_meta.model_dump(mode="json")
+        try:
+            credentials, lock = await creds_manager.acquire(
+                user_id, credentials_meta.id
+            )
+        except ValueError:
+            # Credential was deleted or doesn't exist.
+            # If the field has a default, run without credentials.
+            if input_model.model_fields[field_name].default is not None:
+                log_metadata.warning(
+                    f"Credentials #{credentials_meta.id} not found, "
+                    "running without (field has default)"
+                )
+                input_data[field_name] = None
+                continue
+            raise
         creds_locks.append(lock)
         extra_exec_kwargs[field_name] = credentials
 
@@ -329,17 +375,27 @@ async def execute_node(
         scope.set_tag(f"execution_context.{k}", v)
 
     try:
-        async for output_name, output_data in node_block.execute(
-            input_data, **extra_exec_kwargs
-        ):
+        if execution_context.dry_run:
+            block_iter = simulate_block(node_block, input_data)
+        else:
+            block_iter = node_block.execute(input_data, **extra_exec_kwargs)
+
+        async for output_name, output_data in block_iter:
             output_data = json.to_dict(output_data)
             output_size += len(json.dumps(output_data))
             log_metadata.debug("Node produced output", **{output_name: output_data})
             yield output_name, output_data
     except Exception as ex:
-        # Capture exception WITH context still set before restoring scope
-        sentry_sdk.capture_exception(error=ex, scope=scope)
-        sentry_sdk.flush()  # Ensure it's sent before we restore scope
+        # Only capture unexpected errors to Sentry, not user-caused ones.
+        # Most ValueError subclasses here are expected (BlockExecutionError,
+        # InsufficientBalanceError, plain ValueError for auth/disabled blocks, etc.)
+        # but NotFoundError/GraphNotFoundError could indicate real platform issues.
+        is_expected = isinstance(ex, ValueError) and not isinstance(
+            ex, (NotFoundError, GraphNotFoundError)
+        )
+        if not is_expected:
+            sentry_sdk.capture_exception(error=ex, scope=scope)
+            sentry_sdk.flush()
         # Re-raise to maintain normal error flow
         raise
     finally:
@@ -456,7 +512,9 @@ async def _enqueue_next_nodes(
                 next_node_input.update(node_input_mask)
 
             # Validate the input data for the next node.
-            next_node_input, validation_msg = validate_exec(next_node, next_node_input)
+            next_node_input, validation_msg = validate_exec(
+                next_node, next_node_input, dry_run=execution_context.dry_run
+            )
             suffix = f"{next_output_name}>{next_input_name}~{next_node_exec_id}:{validation_msg}"
 
             # Incomplete input data, skip queueing the execution.
@@ -501,7 +559,9 @@ async def _enqueue_next_nodes(
                 if node_input_mask:
                     idata.update(node_input_mask)
 
-                idata, msg = validate_exec(next_node, idata)
+                idata, msg = validate_exec(
+                    next_node, idata, dry_run=execution_context.dry_run
+                )
                 suffix = f"{next_output_name}>{next_input_name}~{ineid}:{msg}"
                 if not idata:
                     log_metadata.info(f"Enqueueing static-link skipped: {suffix}")
@@ -779,9 +839,12 @@ class ExecutionProcessor:
             return
 
         if exec_meta.stats is None:
-            exec_stats = GraphExecutionStats()
+            exec_stats = GraphExecutionStats(
+                is_dry_run=graph_exec.execution_context.dry_run,
+            )
         else:
             exec_stats = exec_meta.stats.to_db()
+            exec_stats.is_dry_run = graph_exec.execution_context.dry_run
 
         timing_info, status = self._on_graph_execution(
             graph_exec=graph_exec,
@@ -921,7 +984,10 @@ class ExecutionProcessor:
         running_node_evaluation = self.running_node_evaluation
 
         try:
-            if db_client.get_credits(graph_exec.user_id) <= 0:
+            if (
+                not graph_exec.execution_context.dry_run
+                and db_client.get_credits(graph_exec.user_id) <= 0
+            ):
                 raise InsufficientBalanceError(
                     user_id=graph_exec.user_id,
                     message="You have no credits left to run an agent.",
@@ -992,21 +1058,24 @@ class ExecutionProcessor:
                     f"for node {queued_node_exec.node_id}",
                 )
 
-                # Charge usage (may raise) ------------------------------
+                # Charge usage (may raise) — skipped for dry runs
                 try:
-                    cost, remaining_balance = self._charge_usage(
-                        node_exec=queued_node_exec,
-                        execution_count=increment_execution_count(graph_exec.user_id),
-                    )
-                    with execution_stats_lock:
-                        execution_stats.cost += cost
-                    # Check if we crossed the low balance threshold
-                    self._handle_low_balance(
-                        db_client=db_client,
-                        user_id=graph_exec.user_id,
-                        current_balance=remaining_balance,
-                        transaction_cost=cost,
-                    )
+                    if not graph_exec.execution_context.dry_run:
+                        cost, remaining_balance = self._charge_usage(
+                            node_exec=queued_node_exec,
+                            execution_count=increment_execution_count(
+                                graph_exec.user_id
+                            ),
+                        )
+                        with execution_stats_lock:
+                            execution_stats.cost += cost
+                        # Check if we crossed the low balance threshold
+                        self._handle_low_balance(
+                            db_client=db_client,
+                            user_id=graph_exec.user_id,
+                            current_balance=remaining_balance,
+                            transaction_cost=cost,
+                        )
                 except InsufficientBalanceError as balance_error:
                     error = balance_error  # Set error to trigger FAILED status
                     node_exec_id = queued_node_exec.node_exec_id
@@ -1440,7 +1509,7 @@ class ExecutionProcessor:
                     alert_message, DiscordChannel.PRODUCT
                 )
             except Exception as e:
-                logger.error(f"Failed to send low balance Discord alert: {e}")
+                logger.warning(f"Failed to send low balance Discord alert: {e}")
 
 
 class ExecutionManager(AppProcess):
@@ -1862,17 +1931,16 @@ class ExecutionManager(AppProcess):
             channel = client.get_channel()
             channel.connection.add_callback_threadsafe(lambda: channel.stop_consuming())
 
-            try:
-                thread.join(timeout=300)
-            except TimeoutError:
-                logger.error(
+            thread.join(timeout=300)
+            if thread.is_alive():
+                logger.warning(
                     f"{prefix} ⚠️ Run thread did not finish in time, forcing disconnect"
                 )
 
             client.disconnect()
             logger.info(f"{prefix} ✅ Run client disconnected")
         except Exception as e:
-            logger.error(f"{prefix} ⚠️ Error disconnecting run client: {type(e)} {e}")
+            logger.warning(f"{prefix} ⚠️ Error disconnecting run client: {type(e)} {e}")
 
     def cleanup(self):
         """Override cleanup to implement graceful shutdown with active execution waiting."""
@@ -1888,7 +1956,9 @@ class ExecutionManager(AppProcess):
             )
             logger.info(f"{prefix} ✅ Exec consumer has been signaled to stop")
         except Exception as e:
-            logger.error(f"{prefix} ⚠️ Error signaling consumer to stop: {type(e)} {e}")
+            logger.warning(
+                f"{prefix} ⚠️ Error signaling consumer to stop: {type(e)} {e}"
+            )
 
         # Wait for active executions to complete
         if self.active_graph_runs:
@@ -1919,7 +1989,7 @@ class ExecutionManager(AppProcess):
                 waited += wait_interval
 
             if self.active_graph_runs:
-                logger.error(
+                logger.warning(
                     f"{prefix} ⚠️ {len(self.active_graph_runs)} executions still running after {max_wait}s"
                 )
             else:
@@ -1930,7 +2000,7 @@ class ExecutionManager(AppProcess):
             self.executor.shutdown(cancel_futures=True, wait=False)
             logger.info(f"{prefix} ✅ Executor shutdown completed")
         except Exception as e:
-            logger.error(f"{prefix} ⚠️ Error during executor shutdown: {type(e)} {e}")
+            logger.warning(f"{prefix} ⚠️ Error during executor shutdown: {type(e)} {e}")
 
         # Release remaining execution locks
         try:

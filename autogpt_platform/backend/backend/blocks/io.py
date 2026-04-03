@@ -2,9 +2,7 @@ import copy
 from datetime import date, time
 from typing import Any, Optional
 
-# Import for Google Drive file input block
-from backend.blocks.google._drive import AttachmentView, GoogleDriveFile
-from backend.data.block import (
+from backend.blocks._base import (
     Block,
     BlockCategory,
     BlockOutput,
@@ -12,6 +10,9 @@ from backend.data.block import (
     BlockSchemaInput,
     BlockType,
 )
+
+# Import for Google Drive file input block
+from backend.blocks.google._drive import AttachmentView, GoogleDriveFile
 from backend.data.execution import ExecutionContext
 from backend.data.model import SchemaField
 from backend.util.file import store_media_file
@@ -210,7 +211,7 @@ class AgentOutputBlock(Block):
         if input_data.format:
             try:
                 formatter = TextFormatter(autoescape=input_data.escape_html)
-                yield "output", formatter.format_string(
+                yield "output", await formatter.format_string(
                     input_data.format, {input_data.name: input_data.value}
                 )
             except Exception as e:

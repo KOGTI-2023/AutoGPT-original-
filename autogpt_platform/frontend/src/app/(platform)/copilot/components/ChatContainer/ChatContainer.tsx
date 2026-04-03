@@ -2,6 +2,7 @@
 import { ChatInput } from "@/app/(platform)/copilot/components/ChatInput/ChatInput";
 import { UIDataTypes, UIMessage, UITools } from "ai";
 import { LayoutGroup, motion } from "framer-motion";
+import { useCallback } from "react";
 import { ChatMessagesContainer } from "../ChatMessagesContainer/ChatMessagesContainer";
 import { CopilotChatActionsProvider } from "../CopilotChatActionsProvider/CopilotChatActionsProvider";
 import { EmptySession } from "../EmptySession/EmptySession";
@@ -12,10 +13,18 @@ export interface ChatContainerProps {
   error: Error | undefined;
   sessionId: string | null;
   isLoadingSession: boolean;
+  isSessionError?: boolean;
   isCreatingSession: boolean;
+  /** True when backend has an active stream but we haven't reconnected yet. */
+  isReconnecting?: boolean;
   onCreateSession: () => void | Promise<string>;
-  onSend: (message: string) => void | Promise<void>;
+  onSend: (message: string, files?: File[]) => void | Promise<void>;
   onStop: () => void;
+  isUploadingFiles?: boolean;
+  /** Files dropped onto the chat window. */
+  droppedFiles?: File[];
+  /** Called after droppedFiles have been consumed by ChatInput. */
+  onDroppedFilesConsumed?: () => void;
 }
 export const ChatContainer = ({
   messages,
@@ -23,12 +32,37 @@ export const ChatContainer = ({
   error,
   sessionId,
   isLoadingSession,
+  isSessionError,
   isCreatingSession,
+  isReconnecting,
   onCreateSession,
   onSend,
   onStop,
+  isUploadingFiles,
+  droppedFiles,
+  onDroppedFilesConsumed,
 }: ChatContainerProps) => {
+  const isBusy =
+    status === "streaming" ||
+    status === "submitted" ||
+    !!isReconnecting ||
+    isLoadingSession ||
+    !!isSessionError;
   const inputLayoutId = "copilot-2-chat-input";
+
+  // Retry: re-send the last user message (used by ErrorCard on transient errors)
+  const handleRetry = useCallback(() => {
+    const lastUserMsg = [...messages].reverse().find((m) => m.role === "user");
+    const lastText = lastUserMsg?.parts
+      .filter(
+        (p): p is Extract<typeof p, { type: "text" }> => p.type === "text",
+      )
+      .map((p) => p.text)
+      .join("");
+    if (lastText) {
+      onSend(lastText);
+    }
+  }, [messages, onSend]);
 
   return (
     <CopilotChatActionsProvider onSend={onSend}>
@@ -41,6 +75,8 @@ export const ChatContainer = ({
                 status={status}
                 error={error}
                 isLoading={isLoadingSession}
+                sessionID={sessionId}
+                onRetry={handleRetry}
               />
               <motion.div
                 initial={{ opacity: 0 }}
@@ -52,10 +88,13 @@ export const ChatContainer = ({
                 <ChatInput
                   inputId="chat-input-session"
                   onSend={onSend}
-                  disabled={status === "streaming"}
-                  isStreaming={status === "streaming"}
+                  disabled={isBusy}
+                  isStreaming={isBusy}
+                  isUploadingFiles={isUploadingFiles}
                   onStop={onStop}
                   placeholder="What else can I help with?"
+                  droppedFiles={droppedFiles}
+                  onDroppedFilesConsumed={onDroppedFilesConsumed}
                 />
               </motion.div>
             </div>
@@ -65,6 +104,9 @@ export const ChatContainer = ({
               isCreatingSession={isCreatingSession}
               onCreateSession={onCreateSession}
               onSend={onSend}
+              isUploadingFiles={isUploadingFiles}
+              droppedFiles={droppedFiles}
+              onDroppedFilesConsumed={onDroppedFilesConsumed}
             />
           )}
         </div>

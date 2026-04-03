@@ -23,38 +23,30 @@ from prisma.types import (
 from pydantic import BaseModel, BeforeValidator, Field
 from pydantic.fields import computed_field
 
+from backend.blocks import get_block, get_blocks
+from backend.blocks._base import Block, BlockType, EmptySchema
 from backend.blocks.agent import AgentExecutorBlock
 from backend.blocks.io import AgentInputBlock, AgentOutputBlock
 from backend.blocks.llm import LlmModel
-from backend.data.db import prisma as db
-from backend.data.dynamic_fields import is_tool_pin, sanitize_pin_name
-from backend.data.includes import MAX_GRAPH_VERSIONS_FETCH
-from backend.data.model import (
-    CredentialsFieldInfo,
-    CredentialsMetaInput,
-    is_credentials_field_name,
-)
 from backend.integrations.providers import ProviderName
 from backend.util import type as type_utils
 from backend.util.exceptions import GraphNotAccessibleError, GraphNotInLibraryError
 from backend.util.json import SafeJson
 from backend.util.models import Pagination
+from backend.util.request import parse_url
 
-from .block import (
-    AnyBlockSchema,
-    Block,
-    BlockInput,
-    BlockType,
-    EmptySchema,
-    get_block,
-    get_blocks,
-)
-from .db import BaseDbModel, query_raw_with_schema, transaction
-from .includes import AGENT_GRAPH_INCLUDE, AGENT_NODE_INCLUDE
+from .block import BlockInput
+from .db import BaseDbModel
+from .db import prisma as db
+from .db import query_raw_with_schema, transaction
+from .dynamic_fields import is_tool_pin, sanitize_pin_name
+from .includes import AGENT_GRAPH_INCLUDE, AGENT_NODE_INCLUDE, MAX_GRAPH_VERSIONS_FETCH
+from .model import CredentialsFieldInfo, CredentialsMetaInput, is_credentials_field_name
 
 if TYPE_CHECKING:
+    from backend.blocks._base import AnyBlockSchema
+
     from .execution import NodesInputMasks
-    from .integrations import Webhook
 
 logger = logging.getLogger(__name__)
 
@@ -128,7 +120,7 @@ class Node(BaseDbModel):
         return self.metadata.get("credentials_optional", False)
 
     @property
-    def block(self) -> AnyBlockSchema | "_UnknownBlockBase":
+    def block(self) -> "AnyBlockSchema | _UnknownBlockBase":
         """Get the block for this node. Returns UnknownBlock if block is deleted/missing."""
         block = get_block(self.block_id)
         if not block:
@@ -145,21 +137,18 @@ class NodeModel(Node):
     graph_version: int
 
     webhook_id: Optional[str] = None
-    webhook: Optional["Webhook"] = None
+    # webhook: Optional["Webhook"] = None  # deprecated
 
     @staticmethod
     def from_db(node: AgentNode, for_export: bool = False) -> "NodeModel":
-        from .integrations import Webhook
-
         obj = NodeModel(
             id=node.id,
             block_id=node.agentBlockId,
-            input_default=type_utils.convert(node.constantInput, dict[str, Any]),
+            input_default=type_utils.convert(node.constantInput, BlockInput),
             metadata=type_utils.convert(node.metadata, dict[str, Any]),
             graph_id=node.agentGraphId,
             graph_version=node.agentGraphVersion,
             webhook_id=node.webhookId,
-            webhook=Webhook.from_db(node.Webhook) if node.Webhook else None,
         )
         obj.input_links = [Link.from_db(link) for link in node.Input or []]
         obj.output_links = [Link.from_db(link) for link in node.Output or []]
@@ -192,14 +181,13 @@ class NodeModel(Node):
 
         # Remove webhook info
         stripped_node.webhook_id = None
-        stripped_node.webhook = None
 
         return stripped_node
 
     @staticmethod
     def _filter_secrets_from_node_input(
-        input_data: dict[str, Any], schema: dict[str, Any] | None
-    ) -> dict[str, Any]:
+        input_data: BlockInput, schema: dict[str, Any] | None
+    ) -> BlockInput:
         sensitive_keys = ["credentials", "api_key", "password", "token", "secret"]
         field_schemas = schema.get("properties", {}) if schema else {}
         result = {}
@@ -462,6 +450,9 @@ class GraphModel(Graph, GraphMeta):
                     continue
                 if ProviderName.HTTP in field.provider:
                     continue
+                # MCP credentials are intentionally split by server URL
+                if ProviderName.MCP in field.provider:
+                    continue
 
                 # If this happens, that means a block implementation probably needs
                 # to be updated.
@@ -518,6 +509,18 @@ class GraphModel(Graph, GraphMeta):
                 "required": ["id", "provider", "type"],
             }
 
+            # Add a descriptive display title when URL-based discriminator values
+            # are present (e.g. "mcp.sentry.dev" instead of just "Mcp")
+            if (
+                field_info.discriminator
+                and not field_info.discriminator_mapping
+                and field_info.discriminator_values
+            ):
+                hostnames = sorted(
+                    parse_url(str(v)).netloc for v in field_info.discriminator_values
+                )
+                field_schema["display_name"] = ", ".join(hostnames)
+
             # Add other (optional) field info items
             field_schema.update(
                 field_info.model_dump(
@@ -562,8 +565,17 @@ class GraphModel(Graph, GraphMeta):
 
         for graph in [self] + self.sub_graphs:
             for node in graph.nodes:
-                # Track if this node requires credentials (credentials_optional=False means required)
-                node_required_map[node.id] = not node.credentials_optional
+                # A node's credentials are optional if either:
+                # 1. The node metadata says so (credentials_optional=True), or
+                # 2. All credential fields on the block have defaults (not required by schema)
+                block_required = node.block.input_schema.get_required_fields()
+                creds_required_by_schema = any(
+                    fname in block_required
+                    for fname in node.block.input_schema.get_credentials_fields()
+                )
+                node_required_map[node.id] = (
+                    not node.credentials_optional and creds_required_by_schema
+                )
 
                 for (
                     field_name,
@@ -725,7 +737,7 @@ class GraphModel(Graph, GraphMeta):
         # Collect errors per node
         node_errors: dict[str, dict[str, str]] = defaultdict(dict)
 
-        # Validate smart decision maker nodes
+        # Validate tool orchestrator nodes
         nodes_block = {
             node.id: block
             for node in graph.nodes
@@ -788,6 +800,19 @@ class GraphModel(Graph, GraphMeta):
                         f"'{input_key}' is a reserved input name: "
                         "'credentials' and `*_credentials` are reserved"
                     )
+
+            # Check custom block-level validation (e.g., MCP dynamic tool arguments).
+            # Blocks can override get_missing_input to report additional missing fields
+            # beyond the standard top-level required fields.
+            if for_run:
+                credential_fields = InputSchema.get_credentials_fields()
+                custom_missing = InputSchema.get_missing_input(node.input_default)
+                for field_name in custom_missing:
+                    if (
+                        field_name not in provided_inputs
+                        and field_name not in credential_fields
+                    ):
+                        node_errors[node.id][field_name] = "This field is required"
 
             # Get input schema properties and check dependencies
             input_fields = InputSchema.model_fields
@@ -1071,6 +1096,9 @@ async def get_graph(
     Retrieves a graph from the DB.
     Defaults to the version with `is_active` if `version` is not passed.
 
+    See also: `get_graph_as_admin()` which bypasses ownership and marketplace
+    checks for admin-only routes.
+
     Returns `None` if the record is not found.
     """
     graph = None
@@ -1108,6 +1136,27 @@ async def get_graph(
         ):
             graph = store_listing.AgentGraph
 
+    # Fall back to library membership: if the user has the agent in their
+    # library (non-deleted, non-archived), grant access even if the agent is
+    # no longer published. "You added it, you keep it."
+    if graph is None and user_id is not None:
+        library_where: dict[str, object] = {
+            "userId": user_id,
+            "agentGraphId": graph_id,
+            "isDeleted": False,
+            "isArchived": False,
+        }
+        if version is not None:
+            library_where["agentGraphVersion"] = version
+
+        library_agent = await LibraryAgent.prisma().find_first(
+            where=library_where,
+            include={"AgentGraph": {"include": AGENT_GRAPH_INCLUDE}},
+            order={"agentGraphVersion": "desc"},
+        )
+        if library_agent and library_agent.AgentGraph:
+            graph = library_agent.AgentGraph
+
     if graph is None:
         return None
 
@@ -1122,14 +1171,14 @@ async def get_graph(
     return GraphModel.from_db(graph, for_export)
 
 
-async def get_store_listed_graphs(*graph_ids: str) -> dict[str, GraphModel]:
+async def get_store_listed_graphs(graph_ids: list[str]) -> dict[str, GraphModel]:
     """Batch-fetch multiple store-listed graphs by their IDs.
 
     Only returns graphs that have approved store listings (publicly available).
     Does not require permission checks since store-listed graphs are public.
 
     Args:
-        *graph_ids: Variable number of graph IDs to fetch
+        graph_ids: List of graph IDs to fetch
 
     Returns:
         Dict mapping graph_id to GraphModel for graphs with approved store listings
@@ -1182,13 +1231,9 @@ async def get_graph_as_admin(
         order={"version": "desc"},
     )
 
-    # For access, the graph must be owned by the user or listed in the store
-    if graph is None or (
-        graph.userId != user_id
-        and not await is_graph_published_in_marketplace(
-            graph_id, version or graph.version
-        )
-    ):
+    # Admin access bypasses ownership and marketplace checks — route-level
+    # auth already ensures only admins can call this function.
+    if graph is None:
         return None
 
     if for_export:
@@ -1347,8 +1392,9 @@ async def validate_graph_execution_permissions(
     ## Logic
     A user can execute a graph if any of these is true:
     1. They own the graph and some version of it is still listed in their library
-    2. The graph is published in the marketplace and listed in their library
-    3. The graph is published in the marketplace and is being executed as a sub-agent
+    2. The graph is in the user's library (non-deleted, non-archived)
+    3. The graph is published in the marketplace and listed in their library
+    4. The graph is published in the marketplace and is being executed as a sub-agent
 
     Args:
         graph_id: The ID of the graph to check
@@ -1370,6 +1416,7 @@ async def validate_graph_execution_permissions(
             where={
                 "userId": user_id,
                 "agentGraphId": graph_id,
+                "agentGraphVersion": graph_version,
                 "isDeleted": False,
                 "isArchived": False,
             }
@@ -1379,19 +1426,39 @@ async def validate_graph_execution_permissions(
     # Step 1: Check if user owns this graph
     user_owns_graph = graph and graph.userId == user_id
 
-    # Step 2: Check if agent is in the library *and not deleted*
+    # Step 2: Check if the exact graph version is in the library.
     user_has_in_library = library_agent is not None
+    owner_has_live_library_entry = user_has_in_library
+    if user_owns_graph and not user_has_in_library:
+        # Owners are allowed to execute a new version as long as some live
+        # library entry still exists for the graph. Non-owners stay
+        # version-specific.
+        owner_has_live_library_entry = (
+            await LibraryAgent.prisma().find_first(
+                where={
+                    "userId": user_id,
+                    "agentGraphId": graph_id,
+                    "isDeleted": False,
+                    "isArchived": False,
+                }
+            )
+            is not None
+        )
 
     # Step 3: Apply permission logic
+    # Access is granted if the user owns it, it's in the marketplace, OR
+    # it's in the user's library ("you added it, you keep it").
     if not (
         user_owns_graph
+        or user_has_in_library
         or await is_graph_published_in_marketplace(graph_id, graph_version)
     ):
         raise GraphNotAccessibleError(
             f"You do not have access to graph #{graph_id} v{graph_version}: "
-            "it is not owned by you and not available in the Marketplace"
+            "it is not owned by you, not in your library, "
+            "and not available in the Marketplace"
         )
-    elif not (user_has_in_library or is_sub_graph):
+    elif not (user_has_in_library or owner_has_live_library_entry or is_sub_graph):
         raise GraphNotInLibraryError(f"Graph #{graph_id} is not in your library")
 
     # Step 6: Check execution-specific permissions (raises generic NotAuthorizedError)
